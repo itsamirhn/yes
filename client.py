@@ -3,6 +3,8 @@ import base64
 import os
 import uuid
 import logging
+import socket
+from urllib.parse import urlparse
 
 import re
 from base64 import b64encode, b64decode
@@ -27,6 +29,10 @@ if not CHAT_ID:
 
 bot = telegram.Bot(base_url=BASE_URL, token=BOT_TOKEN)
 connects = []
+
+# Proxy settings
+PROXY_HOST = "127.0.0.1"
+PROXY_PORT = 8888
 
 
 class AsyncBytesIO:
@@ -185,6 +191,192 @@ async def run_bot():
             await asyncio.sleep(5)
 
 
+async def forward_data(reader, writer):
+    """Forward data from reader to writer"""
+    try:
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
+
+            # Check if this is our custom AsyncWriteBuffer or asyncio StreamWriter
+            if hasattr(writer, "_buffer"):
+                # Our custom AsyncWriteBuffer - write() is async
+                await writer.write(data)
+                await writer.flush()
+            else:
+                # Standard asyncio StreamWriter - write() is not async
+                writer.write(data)
+                await writer.drain()
+    except Exception as e:
+        logger.error(f"Error forwarding data: {e}")
+    finally:
+        try:
+            if hasattr(writer, "_buffer"):
+                # Our custom buffer doesn't need closing
+                pass
+            else:
+                # Standard asyncio StreamWriter
+                writer.close()
+        except:
+            pass
+
+
+async def handle_http_request(
+    client_reader, client_writer, request_line: str, headers: dict
+):
+    """Handle HTTP request (non-CONNECT)"""
+    try:
+        # Parse the request line
+        method, url, version = request_line.split(" ", 2)
+
+        # Parse the URL to get host and port
+        parsed_url = urlparse(
+            url if url.startswith("http") else f"http://{headers.get('host', '')}{url}"
+        )
+        host = parsed_url.hostname
+        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
+
+        if not host:
+            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        # Connect to target server through telegram bot
+        server_reader, server_writer = await open_connection(host, port)
+
+        # Forward the original request
+        request_data = f"{method} {parsed_url.path or '/'}"
+        if parsed_url.query:
+            request_data += f"?{parsed_url.query}"
+        request_data += f" {version}\r\n"
+
+        # Add headers
+        for header_name, header_value in headers.items():
+            request_data += f"{header_name}: {header_value}\r\n"
+        request_data += "\r\n"
+
+        await server_writer.write(request_data.encode())
+        await server_writer.flush()
+
+        # Start bidirectional forwarding
+        client_to_server = asyncio.create_task(
+            forward_data(client_reader, server_writer)
+        )
+        server_to_client = asyncio.create_task(
+            forward_data(server_reader, client_writer)
+        )
+
+        # Wait for either direction to complete
+        await asyncio.gather(client_to_server, server_to_client, return_exceptions=True)
+
+    except Exception as e:
+        logger.error(f"Error handling HTTP request: {e}")
+        try:
+            client_writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+            await client_writer.drain()
+        except:
+            pass
+
+
+async def handle_https_connect(client_reader, client_writer, host: str, port: int):
+    """Handle HTTPS CONNECT request"""
+    try:
+        # Connect to target server through telegram bot
+        server_reader, server_writer = await open_connection(host, port)
+
+        # Send connection established response
+        client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        await client_writer.drain()
+
+        # Start bidirectional forwarding
+        client_to_server = asyncio.create_task(
+            forward_data(client_reader, server_writer)
+        )
+        server_to_client = asyncio.create_task(
+            forward_data(server_reader, client_writer)
+        )
+
+        # Wait for either direction to complete
+        await asyncio.gather(client_to_server, server_to_client, return_exceptions=True)
+
+    except Exception as e:
+        logger.error(f"Error handling HTTPS CONNECT: {e}")
+        try:
+            client_writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
+            await client_writer.drain()
+        except:
+            pass
+
+
+async def handle_client(client_reader, client_writer):
+    """Handle incoming client connection"""
+    try:
+        # Read the first line (request line)
+        request_line = await client_reader.readline()
+        if not request_line:
+            return
+
+        request_line = request_line.decode().strip()
+
+        # Read headers
+        headers = {}
+        while True:
+            line = await client_reader.readline()
+            if not line or line == b"\r\n":
+                break
+
+            line = line.decode().strip()
+            if ":" in line:
+                key, value = line.split(":", 1)
+                headers[key.strip().lower()] = value.strip()
+
+        # Parse request
+        parts = request_line.split(" ")
+        if len(parts) < 3:
+            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            await client_writer.drain()
+            return
+
+        method = parts[0].upper()
+
+        if method == "CONNECT":
+            # HTTPS tunnel
+            host_port = parts[1]
+            if ":" in host_port:
+                host, port_str = host_port.split(":", 1)
+                port = int(port_str)
+            else:
+                host = host_port
+                port = 443
+
+            await handle_https_connect(client_reader, client_writer, host, port)
+        else:
+            # HTTP request
+            await handle_http_request(
+                client_reader, client_writer, request_line, headers
+            )
+
+    except Exception as e:
+        logger.error(f"Error handling client: {e}")
+    finally:
+        try:
+            client_writer.close()
+        except:
+            pass
+
+
+async def run_proxy():
+    """Run the HTTP/HTTPS proxy server"""
+    server = await asyncio.start_server(handle_client, PROXY_HOST, PROXY_PORT)
+
+    print(f"Proxy server running on {PROXY_HOST}:{PROXY_PORT}")
+    print(f"Configure your browser to use HTTP proxy: {PROXY_HOST}:{PROXY_PORT}")
+
+    async with server:
+        await server.serve_forever()
+
+
 async def test_connection():
     rb, wb = await open_connection("httpbin.org", 80)
 
@@ -201,11 +393,24 @@ async def test_connection():
     print("Received data:")
     print(data.decode("utf-8"))
 
+
 async def main():
+    print("Starting Telegram Bot Proxy...")
+
+    # Start bot in background
     bot_task = asyncio.create_task(run_bot())
     await asyncio.sleep(2)
-    await test_connection()
-    await bot_task
+
+    # Test the connection first
+    # print("Testing connection...")
+    # await test_connection()
+
+    # Start proxy server
+    proxy_task = asyncio.create_task(run_proxy())
+
+    # Keep both running
+    await asyncio.gather(bot_task, proxy_task, return_exceptions=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
