@@ -1,0 +1,11 @@
+# Environment variables
+.env
+.envrc
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+.idea/
+
