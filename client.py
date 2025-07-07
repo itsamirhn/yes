@@ -1,9 +1,7 @@
 import asyncio
-import base64
 import os
 import uuid
 import logging
-import socket
 from urllib.parse import urlparse
 
 import re
@@ -122,6 +120,14 @@ async def handle_ok(message: telegram.Message):
                 )
                 self._buffer = b""
 
+        async def close(self):
+            await self.flush()
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"CLOSE {stream_id}",
+            )
+            logger.info(f"Sent close command for stream_id {stream_id}")
+
     wb = AsyncWriteBuffer()
     connects.append((request_id, stream_id, rb, wb))
 
@@ -213,8 +219,7 @@ async def forward_data(reader, writer):
     finally:
         try:
             if hasattr(writer, "_buffer"):
-                # Our custom buffer doesn't need closing
-                pass
+                await writer.close()
             else:
                 # Standard asyncio StreamWriter
                 writer.close()
