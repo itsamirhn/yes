@@ -157,7 +157,7 @@ async def run():
 
         while True:
             try:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.001)
 
                 updates = await bot.get_updates(
                     offset=last_id + 1 if last_id else None,
@@ -181,7 +181,7 @@ async def run():
                     await close(update.message)
             except Exception as e:
                 logger.error(f"An error occurred: {e}", exc_info=True)
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.001)
 
 
 if __name__ == "__main__":
