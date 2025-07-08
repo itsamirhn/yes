@@ -45,12 +45,13 @@ class AsyncBytesIO:
         await self._queue.put(data)
 
     async def read(self, size: int = -1):
-        if self._closed:
-            return b""
-
         while len(self._buffer) < size or size == -1:
             try:
                 data = await asyncio.wait_for(self._queue.get(), timeout=3)
+                if data is None:
+                    # Stream is closed
+                    self._closed = True
+                    break
                 self._buffer += data
             except asyncio.TimeoutError:
                 break
@@ -64,8 +65,10 @@ class AsyncBytesIO:
 
         return result
 
-    def close(self):
-        self._closed = True
+    async def close(self):
+        if not self._closed:
+            self._closed = True
+            await self._queue.put(None)
 
 
 async def open_connection(host: str, port: int):
@@ -86,7 +89,7 @@ async def handle_ok(message: telegram.Message):
     if not message.text:
         return
 
-    group = re.search(r"^OK ([^\s]+) ([^\s]+)$", message.text)
+    group = re.search(r"^OK (\S+) (\S+)$", message.text)
     if group is None:
         return
 
@@ -104,7 +107,7 @@ async def handle_ok(message: telegram.Message):
     class AsyncWriteBuffer:
         def __init__(self):
             self._buffer = b""
-            self._buffer_size = 4096 - len(f"SEND {stream_id} ".encode("utf-8"))
+            self._buffer_size = 4096
 
         async def write(self, data):
             self._buffer += data
@@ -136,7 +139,7 @@ async def handle_recv(message: telegram.Message):
     if not message.text:
         return
 
-    group = re.search(r"^RECV ([^\s]+) (.+)$", message.text)
+    group = re.search(r"^RECV (\S+) (\S+)$", message.text)
     if group is None:
         return
 
@@ -155,13 +158,27 @@ async def handle_close(message: telegram.Message):
     if not message.text:
         return
 
-    group = re.search(r"^CLOSED (\w+)$", message.text)
+    group = re.search(r"^CLOSED (\S+)$", message.text)
     if group is None:
         return
 
-    request_id = group.group(1)
+    stream_id = group.group(1)
     logger.info(f"Received close message: {message.text}")
-    connects[:] = [connect for connect in connects if connect[0] != request_id]
+
+    # Find the connection and close the AsyncBytesIO instance
+    connection_to_close = None
+    for connect in connects:
+        if connect[1] == stream_id:
+            connection_to_close = connect
+            break
+
+    if connection_to_close:
+        # Close the AsyncBytesIO instance (rb is at index 2)
+        rb = connection_to_close[2]
+        await rb.close()
+
+    # Remove the connection from the list
+    connects[:] = [connect for connect in connects if connect[1] != stream_id]
 
 
 async def run_bot():

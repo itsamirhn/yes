@@ -8,7 +8,7 @@ from base64 import b64encode, b64decode
 import telegram
 
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -31,7 +31,7 @@ async def run():
             if not message.text:
                 return
 
-            group = re.search(r"^CONNECT ([^\s]+) ([^\s]+) (\d+)$", message.text)
+            group = re.search(r"^CONNECT (\S+) (\S+) (\d+)$", message.text)
             if group is None:
                 return
 
@@ -50,15 +50,18 @@ async def run():
 
             async def reader():
                 while True:
-                    data = await read.read(1024)
+                    data = await read.read(2000)
                     if not data:
                         logger.info(f"Connection closed for stream_id {stream_id}")
-                        del connects[stream_id]
-                        await bot.send_message(
-                            chat_id=message.chat.id,
-                            text=f"CLOSED {request_id} {stream_id}",
-                        )
+                        if stream_id in connects:
+                            del connects[stream_id]
+                            await bot.send_message(
+                                chat_id=message.chat.id,
+                                text=f"CLOSED {stream_id}",
+                            )
+
                         break
+
                     logger.debug(f"Received data on stream_id {stream_id}: {data}")
 
                     await bot.send_message(
@@ -75,7 +78,7 @@ async def run():
             if not message.text:
                 return
 
-            group = re.search(r"^SEND (\w+) (.+)$", message.text)
+            group = re.search(r"^SEND (\S+) (\S+)$", message.text)
             if group is None:
                 return
 
@@ -95,7 +98,7 @@ async def run():
             if not message.text:
                 return
 
-            group = re.search(r"^CLOSE (\w+)$", message.text)
+            group = re.search(r"^CLOSE (\S+)$", message.text)
             if group is None:
                 return
 
@@ -110,9 +113,14 @@ async def run():
             write.close()
             del connects[stream_id]
 
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text=f"CLOSED {stream_id}",
+            )
+
         while True:
             try:
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.001)
 
                 updates = await bot.get_updates(
                     offset=last_id + 1 if last_id else None,
@@ -136,7 +144,7 @@ async def run():
                     await close(update.message)
             except Exception as e:
                 logger.error(f"An error occurred: {e}", exc_info=True)
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.001)
 
 
 if __name__ == "__main__":
