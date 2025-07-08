@@ -73,7 +73,7 @@ async def open_connection(host: str, port: int):
     await bot.send_message(chat_id=CHAT_ID, text=f"CONNECT {request_id} {host} {port}")
 
     while not any(request_id == connect[0] for connect in connects):
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.001)
 
     rb, wb = next(
         (connect[2], connect[3]) for connect in connects if connect[0] == request_id
@@ -169,7 +169,7 @@ async def run_bot():
 
     while True:
         try:
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.001)
 
             updates = await bot.get_updates(
                 offset=last_id + 1 if last_id else None,
@@ -194,7 +194,7 @@ async def run_bot():
 
         except Exception as e:
             logger.error(f"An error occurred: {e}", exc_info=True)
-            await asyncio.sleep(5)
+            await asyncio.sleep(0.001)
 
 
 async def forward_data(reader, writer):
