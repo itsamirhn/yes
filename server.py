@@ -21,6 +21,8 @@ if not BOT_TOKEN:
     raise ValueError("SERVER_BOT_TOKEN environment variable is required")
 
 connects = {}
+# Track sequence numbers for each stream: {stream_id: {'send_seq': int, 'recv_seq': int, 'recv_buffer': dict}}
+stream_seqs = {}
 
 
 async def run():
@@ -47,6 +49,8 @@ async def run():
             stream_id = uuid.uuid4().hex
             read, write = await asyncio.open_connection(host, port)
             connects[stream_id] = (read, write)
+            # Initialize sequence tracking for this stream
+            stream_seqs[stream_id] = {"send_seq": 0, "recv_seq": 0, "recv_buffer": {}}
 
             async def reader():
                 while True:
@@ -54,6 +58,8 @@ async def run():
                     if not data:
                         logger.info(f"Connection closed for stream_id {stream_id}")
                         del connects[stream_id]
+                        if stream_id in stream_seqs:
+                            del stream_seqs[stream_id]
                         await bot.send_message(
                             chat_id=message.chat.id,
                             text=f"CLOSED {request_id} {stream_id}",
@@ -61,9 +67,13 @@ async def run():
                         break
                     logger.debug(f"Received data on stream_id {stream_id}: {data}")
 
+                    # Get and increment sequence number
+                    seq_num = stream_seqs[stream_id]["send_seq"]
+                    stream_seqs[stream_id]["send_seq"] += 1
+
                     await bot.send_message(
                         chat_id=message.chat.id,
-                        text=f"RECV {stream_id} {b64encode(data).decode('utf-8')}",
+                        text=f"RECV {stream_id} {seq_num} {b64encode(data).decode('utf-8')}",
                     )
 
             asyncio.create_task(reader())
@@ -75,21 +85,53 @@ async def run():
             if not message.text:
                 return
 
-            group = re.search(r"^SEND (\w+) (.+)$", message.text)
+            group = re.search(r"^SEND (\w+) (\d+) (.+)$", message.text)
             if group is None:
                 return
 
             stream_id = group.group(1)
-            data = b64decode(group.group(2))
+            seq_num = int(group.group(2))
+            data = b64decode(group.group(3))
 
             if stream_id not in connects:
                 logger.warning(f"No connection found for stream_id {stream_id}")
                 return
 
-            logger.debug(f"Sending data to stream_id {stream_id}: {data}")
-            _, write = connects[stream_id]
-            write.write(data)
-            await write.drain()
+            if stream_id not in stream_seqs:
+                logger.warning(f"No sequence tracking found for stream_id {stream_id}")
+                return
+
+            # Check if this is the next expected sequence number
+            expected_seq = stream_seqs[stream_id]["recv_seq"]
+            if seq_num == expected_seq:
+                # This is the expected sequence number, send immediately
+                logger.debug(
+                    f"Sending data to stream_id {stream_id} seq {seq_num}: {data}"
+                )
+                _, write = connects[stream_id]
+                write.write(data)
+                await write.drain()
+                stream_seqs[stream_id]["recv_seq"] += 1
+
+                # Check if we have buffered messages that can now be sent
+                recv_buffer = stream_seqs[stream_id]["recv_buffer"]
+                next_seq = stream_seqs[stream_id]["recv_seq"]
+                while next_seq in recv_buffer:
+                    buffered_data = recv_buffer.pop(next_seq)
+                    logger.debug(
+                        f"Sending buffered data to stream_id {stream_id} seq {next_seq}: {buffered_data}"
+                    )
+                    _, write = connects[stream_id]
+                    write.write(buffered_data)
+                    await write.drain()
+                    stream_seqs[stream_id]["recv_seq"] += 1
+                    next_seq += 1
+            else:
+                # Out of order message, buffer it
+                logger.debug(
+                    f"Buffering out-of-order message for stream_id {stream_id} seq {seq_num} (expected {expected_seq})"
+                )
+                stream_seqs[stream_id]["recv_buffer"][seq_num] = data
 
         async def close(message: telegram.Message):
             if not message.text:
@@ -109,6 +151,9 @@ async def run():
             _, write = connects[stream_id]
             write.close()
             del connects[stream_id]
+            # Clean up sequence tracking
+            if stream_id in stream_seqs:
+                del stream_seqs[stream_id]
 
         while True:
             try:

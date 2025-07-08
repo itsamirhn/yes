@@ -27,6 +27,8 @@ if not CHAT_ID:
 
 bot = telegram.Bot(base_url=BASE_URL, token=BOT_TOKEN)
 connects = []
+# Track sequence numbers for each stream: {stream_id: {'send_seq': int, 'recv_seq': int, 'recv_buffer': dict}}
+stream_seqs = {}
 
 # Proxy settings
 PROXY_HOST = "127.0.0.1"
@@ -104,7 +106,7 @@ async def handle_ok(message: telegram.Message):
     class AsyncWriteBuffer:
         def __init__(self):
             self._buffer = b""
-            self._buffer_size = 4096 - len(f"SEND {stream_id} ".encode("utf-8"))
+            self._buffer_size = 4096 - len(f"SEND {stream_id} 9999 ".encode("utf-8"))
 
         async def write(self, data):
             self._buffer += data
@@ -114,9 +116,13 @@ async def handle_ok(message: telegram.Message):
 
         async def flush(self):
             if self._buffer:
+                # Get and increment sequence number
+                seq_num = stream_seqs[stream_id]["send_seq"]
+                stream_seqs[stream_id]["send_seq"] += 1
+
                 await bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"SEND {stream_id} {b64encode(self._buffer).decode('utf-8')}",
+                    text=f"SEND {stream_id} {seq_num} {b64encode(self._buffer).decode('utf-8')}",
                 )
                 self._buffer = b""
 
@@ -127,28 +133,63 @@ async def handle_ok(message: telegram.Message):
                 text=f"CLOSE {stream_id}",
             )
             logger.info(f"Sent close command for stream_id {stream_id}")
+            # Clean up sequence tracking
+            if stream_id in stream_seqs:
+                del stream_seqs[stream_id]
 
     wb = AsyncWriteBuffer()
     connects.append((request_id, stream_id, rb, wb))
+    # Initialize sequence tracking for this stream
+    stream_seqs[stream_id] = {"send_seq": 0, "recv_seq": 0, "recv_buffer": {}}
 
 
 async def handle_recv(message: telegram.Message):
     if not message.text:
         return
 
-    group = re.search(r"^RECV ([^\s]+) (.+)$", message.text)
+    group = re.search(r"^RECV ([^\s]+) (\d+) (.+)$", message.text)
     if group is None:
         return
 
     stream_id = group.group(1)
-    data = b64decode(group.group(2))
+    seq_num = int(group.group(2))
+    data = b64decode(group.group(3))
 
     if not any(connect[1] == stream_id for connect in connects):
         logger.warning(f"No connection found for stream_id {stream_id}")
         return
 
+    if stream_id not in stream_seqs:
+        logger.warning(f"No sequence tracking found for stream_id {stream_id}")
+        return
+
     rb = next(connect[2] for connect in connects if connect[1] == stream_id)
-    await rb.write(data)
+
+    # Check if this is the next expected sequence number
+    expected_seq = stream_seqs[stream_id]["recv_seq"]
+    if seq_num == expected_seq:
+        # This is the expected sequence number, write immediately
+        logger.debug(f"Received data for stream_id {stream_id} seq {seq_num}")
+        await rb.write(data)
+        stream_seqs[stream_id]["recv_seq"] += 1
+
+        # Check if we have buffered messages that can now be written
+        recv_buffer = stream_seqs[stream_id]["recv_buffer"]
+        next_seq = stream_seqs[stream_id]["recv_seq"]
+        while next_seq in recv_buffer:
+            buffered_data = recv_buffer.pop(next_seq)
+            logger.debug(
+                f"Writing buffered data for stream_id {stream_id} seq {next_seq}"
+            )
+            await rb.write(buffered_data)
+            stream_seqs[stream_id]["recv_seq"] += 1
+            next_seq += 1
+    else:
+        # Out of order message, buffer it
+        logger.debug(
+            f"Buffering out-of-order message for stream_id {stream_id} seq {seq_num} (expected {expected_seq})"
+        )
+        stream_seqs[stream_id]["recv_buffer"][seq_num] = data
 
 
 async def handle_close(message: telegram.Message):
@@ -161,6 +202,13 @@ async def handle_close(message: telegram.Message):
 
     request_id = group.group(1)
     logger.info(f"Received close message: {message.text}")
+
+    # Clean up sequence tracking for closed connections
+    closed_streams = [connect[1] for connect in connects if connect[0] == request_id]
+    for stream_id in closed_streams:
+        if stream_id in stream_seqs:
+            del stream_seqs[stream_id]
+
     connects[:] = [connect for connect in connects if connect[0] != request_id]
 
 
