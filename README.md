@@ -1,222 +1,168 @@
-# Telegram as Proxy PoC
+# Telegram (or Bale) as Proxy - Proof of Concept
 
-A proof-of-concept implementation of creating a network proxy tunnel through Telegram (or similar messaging platforms like Bale messenger) to bypass network firewalls and censorship.
+This project shows how you can tunnel internet traffic through Telegram (or platforms with a similar backend, such as Bale) to get around firewalls and censorship.
 
-## 🎯 Concept
+## Concept
 
-This project demonstrates how messaging platforms can be used as a communication channel to establish a proxy tunnel, enabling internet access in censored environments.
+Messaging platforms usually have open access to the internet, even when other services are blocked. This proof-of-concept uses that fact to pass proxy traffic through a Telegram channel.
 
-## 🔧 How It Works
+## How It Works
 
 ### Architecture Overview
 
+The diagram below shows how the system works when the server bot uses a webhook.
+In polling mode, the server does not receive updates from the messenger backend directly; instead, it repeatedly polls for new messages. The rest of the flow stays roughly the same.
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant U as User
+    participant C as Proxy Client (Local)
+    participant M as Messenger Backend (Telegram Channel)
+    participant S as Proxy Server (Remote)
+    participant I as Open Internet
+
+    U->>C: Make request (HTTP/HTTPS)
+    C->>M: Send CONNECT message to channel
+    M-->>S: Webhook delivers message to server bot
+    S->>I: Connect to target and fetch data
+    S->>M: Send response message to channel
+    C->>M: Poll for new messages
+    M-->>C: Deliver response message
+    C->>U: Return real response
 ```
-Laptop/Browser → Client Bot → Telegram Channel → Server Bot → Free Internet
-   (Censored)      (Local)      (Messenger)      (Outside)    (Unrestricted)
-```
-
-### Components
-
-1. **Client Bot** (`client.py`): Runs locally on your device behind the firewall
-   - Acts as an HTTP/HTTPS proxy server (default: `127.0.0.1:8888`)
-   - Forwards requests to the Telegram channel
-   - Receives responses from the server bot through the channel
-
-2. **Server Bot** (`server.py`): Runs outside the firewall (on a VPS or unrestricted server)
-   - Monitors the Telegram channel for connection requests
-   - Establishes actual connections to target websites
-   - Relays data back through the Telegram channel
-
-3. **Telegram Channel**: Acts as the communication bridge between both bots
-   - Both bots must be added as administrators in the channel
-   - Serves as a message queue for bidirectional data transfer
 
 ### Communication Protocol
 
-The bots communicate using text-based commands through the Telegram channel:
+Bots talk using short text commands:
 
-- **CONNECT**: Client requests a new connection
+```
+CONNECT {request_id} {host} {port}
+OK {request_id} {stream_id}
+SEND {stream_id} {base64_data}
+RECV {stream_id} {base64_data}
+CLOSE {stream_id}
+CLOSED {stream_id}
+```
 
-  ```
-  CONNECT {request_id} {host} {port}
-  ```
+### Why It Works
 
-- **OK**: Server acknowledges connection
+If Telegram is reachable, the tunnel works. Telegram’s backend has unrestricted internet access, so messages become the transport layer for the proxy.
 
-  ```
-  OK {request_id} {stream_id}
-  ```
+#### Firewall Scenarios
 
-- **SEND**: Send data through the tunnel
+* **Polling mode:** Works when outbound traffic is limited. The server bot polls Telegram for messages.
+* **Webhook mode:** Works when inbound traffic is allowed. Telegram sends updates directly to the server.
 
-  ```
-  SEND {stream_id} {base64_encoded_data}
-  ```
+The tunnel only needs one direction (inbound or outbound) to be open.
 
-- **RECV**: Receive data from the tunnel
+---
 
-  ```
-  RECV {stream_id} {base64_encoded_data}
-  ```
+## Setup
 
-- **CLOSE/CLOSED**: Close connection
+### Requirements
 
-  ```
-  CLOSE {stream_id}
-  CLOSED {stream_id}
-  ```
+* Python 3.12 or newer
+* Two Telegram bot tokens
+* One Telegram channel where both bots are admins
+* A server outside the censored network
 
-### Why This Works
-
-The key insight is that **messenger backends typically have unrestricted access to the internet**, even in censored regions. As long as the messaging platform itself is accessible, you can tunnel data through it.
-
-#### Firewall Bypass Strategies
-
-Depending on the firewall configuration, the server bot can use different methods:
-
-- **Polling Mode** (getUpdates): Works when egress (outbound) filtering exists
-  - Server actively polls Telegram for new messages
-  - No inbound connections required
-
-- **Webhook Mode**: Works when ingress (inbound) filtering exists
-  - Telegram pushes updates to the server
-  - More efficient but requires accepting inbound connections
-
-This flexibility means that **as long as either ingress OR egress is not completely blocked**, the tunnel can function.
-
-## 🚀 Setup
-
-### Prerequisites
-
-- Python 3.12 or higher
-- Two Telegram bot tokens (via [@BotFather](https://t.me/botfather))
-- A Telegram channel where both bots are administrators
-- A server outside the firewall for running the server bot
-
-### Installation
-
-1. Clone the repository:
+### Install
 
 ```bash
 git clone <repository-url>
 cd yes
-```
-
-2. Install dependencies using [uv](https://docs.astral.sh/uv/):
-
-```bash
 uv sync
 ```
 
 ### Configuration
 
-#### For the Client Bot (local machine)
-
-Set the following environment variables:
+#### Client (local machine)
 
 ```bash
 export CLIENT_BOT_TOKEN="your_client_bot_token"
-export CHAT_ID="your_telegram_channel_id"  # numeric ID
-export BASE_URL="https://api.telegram.org/bot"  # Optional: for custom Telegram API servers
+export CHAT_ID="your_channel_id"
+export BASE_URL="https://api.telegram.org/bot"
 ```
 
-#### For the Server Bot (external server)
-
-Set the following environment variables:
+#### Server (external server)
 
 ```bash
 export SERVER_BOT_TOKEN="your_server_bot_token"
-export BASE_URL="https://api.telegram.org/bot"  # Optional: for custom Telegram API servers
+export BASE_URL="https://api.telegram.org/bot"
 ```
 
 ### Running
 
-1. **Start the server bot** (on your external server):
+Start the server bot:
 
 ```bash
 python server.py
 ```
 
-2. **Start the client bot** (on your local machine):
+Start the client bot:
 
 ```bash
 python client.py
 ```
 
-3. **Configure your browser** to use the proxy:
-   - Proxy type: HTTP/HTTPS
-   - Host: `127.0.0.1`
-   - Port: `8888`
+Set your browser’s proxy to:
 
-## 📝 Usage Example
+* Host: `127.0.0.1`
+* Port: `8888`
+* Protocol: HTTP/HTTPS
 
-Once both bots are running, you can:
-
-1. Configure your browser to use `127.0.0.1:8888` as an HTTP proxy
-2. Browse the internet normally
-3. All traffic will be tunneled through the Telegram channel
+---
 
 ### Testing
 
-The client includes a test function to verify connectivity:
+Inside `client.py`, you can enable the test function:
 
 ```python
-# Uncomment in client.py main() function:
 await test_connection()
 ```
 
-## ⚠️ Limitations
+---
 
-- **Speed**: Limited by Telegram's rate limits and message processing speed
-- **Latency**: Higher latency due to message queuing through Telegram
-- **Reliability**: Dependent on Telegram's availability
-- **Scale**: Not suitable for high-bandwidth applications
+## Limitations
 
-## 🔒 Security Considerations
+* Slow due to Messenger rate limits
+* Higher latency
+* Depends on Messenger uptime
+* Not built for heavy traffic
 
-- Data is base64-encoded but **not encrypted** beyond Telegram's own encryption
-- Bot tokens should be kept secret
-- This is a PoC and not intended for production use
-- Consider adding additional encryption for sensitive data
+---
 
-## 🌐 Alternative Messengers
+## Using Other Messengers
 
-This works on any messenger with telegram backend such as Soroush or Bale messenger. For other messengers, the API has to be changed in the code.
+This can work with any platform that uses the Telegram API backend (like Soroush or Bale).
+To switch, change the API base URL:
 
-Simply modify the `BASE_URL` to point to the alternative platform's API endpoint.
+```bash
+export BASE_URL="https://api.example.com/bot"
+```
 
-## 📚 Technical Details
+Platforms with different APIs require code changes.
 
-### Data Flow Example
+---
 
-1. User makes an HTTPS request in their browser
-2. Client bot receives the CONNECT request
-3. Client sends `CONNECT {request_id} {host} {port}` to the channel
-4. Server bot picks up the message
-5. Server bot establishes a TCP connection to the target
-6. Server responds with `OK {request_id} {stream_id}`
-7. Data is exchanged using `SEND` and `RECV` commands with base64-encoded payloads
-8. Connections are closed with `CLOSE`/`CLOSED` commands
+## Technical Details
+
+### Data Flow
+
+1. Browser makes an HTTPS request
+2. Client bot sends a `CONNECT` command
+3. Server bot opens the connection
+4. Data is exchanged using `SEND` and `RECV`
+5. Both sides close the connection with `CLOSE` and `CLOSED`
 
 ### Connection Pooling
 
-The implementation maintains connection pools on both sides to handle multiple simultaneous connections, enabling normal web browsing with multiple tabs and resources.
+Both sides keep track of multiple active streams, which allows normal web browsing with several tabs and assets loading in parallel.
 
-## 📄 License
+---
 
-This is a proof-of-concept project for educational purposes.
+## Disclaimer
 
-## 🤝 Contributing
-
-Contributions are welcome! Possible improvements:
-
-- Add end-to-end encryption for data payloads
-- Implement connection pooling optimizations
-- Add support for SOCKS proxy protocol
-- Implement webhook support for the server bot
-- Add bandwidth and latency metrics
-- Support for other messaging platforms
-
-## ⚖️ Disclaimer
-
-This tool is provided for educational and research purposes. Users are responsible for complying with their local laws and the terms of service of messaging platforms. Use responsibly and ethically.
+This project is for educational and research purposes only. Follow local laws and the terms of service of messaging platforms.
