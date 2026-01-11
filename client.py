@@ -199,15 +199,16 @@ async def run_bot():
             last_id = max(update.update_id for update in updates)
 
             for update in updates:
-                if update.message and update.message.text:
-                    logger.debug(f"Received message: {update.message.text}")
+                message = update.channel_post
+                if message and message.text:
+                    logger.debug(f"Received message: {message.text}")
 
-                if update.message is None:
+                if message is None:
                     continue
 
-                await handle_ok(update.message)
-                await handle_recv(update.message)
-                await handle_close(update.message)
+                await handle_ok(message)
+                await handle_recv(message)
+                await handle_close(message)
 
         except Exception as e:
             logger.error(f"An error occurred: {e}", exc_info=True)

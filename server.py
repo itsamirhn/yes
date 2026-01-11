@@ -120,7 +120,7 @@ async def run():
 
         while True:
             try:
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.01)
 
                 updates = await bot.get_updates(
                     offset=last_id + 1 if last_id else None,
@@ -133,18 +133,19 @@ async def run():
                 last_id = max(update.update_id for update in updates)
 
                 for update in updates:
-                    if update.message and update.message.text:
-                        logger.debug(f"Received message: {update.message.text}")
+                    message = update.channel_post
+                    if message and message.text:
+                        logger.info(f"Received message: {message.text}")
 
-                    if update.message is None:
+                    if message is None:
                         continue
 
-                    await connect(update.message)
-                    await send(update.message)
-                    await close(update.message)
+                    await connect(message)
+                    await send(message)
+                    await close(message)
             except Exception as e:
                 logger.error(f"An error occurred: {e}", exc_info=True)
-                await asyncio.sleep(0.001)
+                await asyncio.sleep(0.01)
 
 
 if __name__ == "__main__":
