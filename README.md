@@ -127,17 +127,11 @@ Start the server bot:
 python server.py
 ```
 
-Start the client bot:
-
-```bash
-python client.py
-```
-
-Set your browser’s proxy to:
-
-* Host: `127.0.0.1`
-* Port: `8888`
-* Protocol: HTTP/HTTPS
+1. **Client Bot** (`client.py`): Runs locally on your device behind the firewall
+   - Acts as an HTTP/HTTPS/SOCKS5 proxy server (default: `127.0.0.1:8888`)
+   - Auto-detects protocol on the same port
+   - Forwards requests to the Telegram channel
+   - Receives responses from the server bot through the channel
 
 ---
 
