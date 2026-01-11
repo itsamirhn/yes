@@ -339,15 +339,79 @@ async def handle_https_connect(client_reader, client_writer, host: str, port: in
             pass
 
 
-async def handle_client(client_reader, client_writer):
-    """Handle incoming client connection"""
+async def handle_socks5_client(client_reader, client_writer, first_byte):
+    """Handle SOCKS5 client connection"""
     try:
-        # Read the first line (request line)
-        request_line = await client_reader.readline()
-        if not request_line:
+        # Read remaining greeting (nmethods) - we already read version (0x05)
+        nmethods = (await client_reader.readexactly(1))[0]
+        methods = await client_reader.readexactly(nmethods)
+
+        # Reply with no-auth (0x00)
+        client_writer.write(b'\x05\x00')
+        await client_writer.drain()
+
+        # Read request: VER CMD RSV ATYP
+        request = await client_reader.readexactly(4)
+        ver, cmd, _, atyp = request
+
+        if cmd != 0x01:  # Only CONNECT supported
+            client_writer.write(b'\x05\x07\x00\x01' + b'\x00' * 6)
+            await client_writer.drain()
             return
 
-        request_line = request_line.decode().strip()
+        # Parse destination address
+        if atyp == 0x01:  # IPv4
+            addr_bytes = await client_reader.readexactly(4)
+            host = '.'.join(str(b) for b in addr_bytes)
+        elif atyp == 0x03:  # Domain name
+            length = (await client_reader.readexactly(1))[0]
+            host = (await client_reader.readexactly(length)).decode()
+        elif atyp == 0x04:  # IPv6
+            addr_bytes = await client_reader.readexactly(16)
+            host = ':'.join(f'{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}' for i in range(0, 16, 2))
+        else:
+            client_writer.write(b'\x05\x08\x00\x01' + b'\x00' * 6)
+            await client_writer.drain()
+            return
+
+        port_bytes = await client_reader.readexactly(2)
+        port = int.from_bytes(port_bytes, 'big')
+
+        logger.info(f"SOCKS5 CONNECT to {host}:{port}")
+
+        # Connect via Telegram tunnel
+        server_reader, server_writer = await open_connection(host, port)
+
+        # Success reply
+        client_writer.write(b'\x05\x00\x00\x01' + b'\x00' * 6)
+        await client_writer.drain()
+
+        # Relay data bidirectionally
+        await asyncio.gather(
+            forward_data(client_reader, server_writer),
+            forward_data(server_reader, client_writer),
+            return_exceptions=True
+        )
+    except Exception as e:
+        logger.error(f"SOCKS5 error: {e}")
+
+
+async def handle_client(client_reader, client_writer):
+    """Handle incoming client connection (HTTP/HTTPS or SOCKS5)"""
+    try:
+        # Read first byte to detect protocol
+        first_byte = await client_reader.readexactly(1)
+        if not first_byte:
+            return
+
+        if first_byte[0] == 0x05:
+            # SOCKS5 protocol
+            await handle_socks5_client(client_reader, client_writer, first_byte)
+            return
+
+        # HTTP/HTTPS - read rest of first line
+        rest_of_line = await client_reader.readline()
+        request_line = (first_byte + rest_of_line).decode().strip()
 
         # Read headers
         headers = {}
@@ -397,11 +461,11 @@ async def handle_client(client_reader, client_writer):
 
 
 async def run_proxy():
-    """Run the HTTP/HTTPS proxy server"""
+    """Run the HTTP/HTTPS/SOCKS5 proxy server"""
     server = await asyncio.start_server(handle_client, PROXY_HOST, PROXY_PORT)
 
     print(f"Proxy server running on {PROXY_HOST}:{PROXY_PORT}")
-    print(f"Configure your browser to use HTTP proxy: {PROXY_HOST}:{PROXY_PORT}")
+    print(f"Supports HTTP, HTTPS, and SOCKS5 proxy on the same port")
 
     async with server:
         await server.serve_forever()
