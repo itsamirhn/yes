@@ -3,7 +3,7 @@ import os
 import uuid
 import re
 import logging
-from base64 import b64encode, b64decode
+
 
 import telegram
 
@@ -19,6 +19,9 @@ BOT_TOKEN: str = os.environ.get("SERVER_BOT_TOKEN", "")
 
 if not BOT_TOKEN:
     raise ValueError("SERVER_BOT_TOKEN environment variable is required")
+
+# Buffer/chunk size for data transfer (tune this for performance)
+CHUNK_SIZE = 4096
 
 connects = {}
 
@@ -50,7 +53,7 @@ async def run():
 
             async def reader():
                 while True:
-                    data = await read.read(2000)
+                    data = await read.read(CHUNK_SIZE)
                     if not data:
                         logger.info(f"Connection closed for stream_id {stream_id}")
                         if stream_id in connects:
@@ -64,9 +67,10 @@ async def run():
 
                     logger.debug(f"Received data on stream_id {stream_id}: {data}")
 
-                    await bot.send_message(
+                    await bot.send_document(
                         chat_id=message.chat.id,
-                        text=f"RECV {stream_id} {b64encode(data).decode('utf-8')}",
+                        document=data,
+                        filename=f"RECV_{stream_id}.bin",
                     )
 
             asyncio.create_task(reader())
@@ -75,15 +79,19 @@ async def run():
             )
 
         async def send(message: telegram.Message):
-            if not message.text:
+            if not message.document:
                 return
 
-            group = re.search(r"^SEND (\S+) (\S+)$", message.text)
-            if group is None:
+            filename = message.document.file_name
+            if not filename or not filename.startswith("SEND_"):
                 return
 
-            stream_id = group.group(1)
-            data = b64decode(group.group(2))
+            # Parse stream_id from filename: SEND_{stream_id}.bin
+            stream_id = filename[5:-4]  # Remove "SEND_" and ".bin"
+
+            # Download file content
+            file = await message.document.get_file()
+            data = bytes(await file.download_as_bytearray())
 
             if stream_id not in connects:
                 logger.warning(f"No connection found for stream_id {stream_id}")

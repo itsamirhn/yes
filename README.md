@@ -35,6 +35,7 @@ sequenceDiagram
 
 ### Communication Protocol
 
+<<<<<<< HEAD
 Bots talk using short text commands:
 
 ```
@@ -45,13 +46,23 @@ RECV {stream_id} {base64_data}
 CLOSE {stream_id}
 CLOSED {stream_id}
 ```
+=======
+The bots communicate using a combination of text commands and file uploads through the Telegram channel:
+
+- **CONNECT**: Client requests a new connection (text message)
+>>>>>>> 3452a82 (feat: File!)
 
 ### Why It Works
 
+<<<<<<< HEAD
 If Telegram is reachable, the tunnel works. Telegram’s backend has unrestricted internet access, so messages become the transport layer for the proxy.
+=======
+- **OK**: Server acknowledges connection (text message)
+>>>>>>> 3452a82 (feat: File!)
 
 #### Firewall Scenarios
 
+<<<<<<< HEAD
 * **Polling mode:** Works when outbound traffic is limited. The server bot polls Telegram for messages.
 * **Webhook mode:** Works when inbound traffic is allowed. Telegram sends updates directly to the server.
 
@@ -62,6 +73,21 @@ The tunnel only needs one direction (inbound or outbound) to be open.
 ## Setup
 
 ### Requirements
+=======
+- **SEND**: Send data through the tunnel (file upload)
+
+  ```
+  File: SEND_{stream_id}.bin (raw binary content)
+  ```
+
+- **RECV**: Receive data from the tunnel (file upload)
+
+  ```
+  File: RECV_{stream_id}.bin (raw binary content)
+  ```
+
+- **CLOSE/CLOSED**: Close connection (text message)
+>>>>>>> 3452a82 (feat: File!)
 
 * Python 3.12 or newer
 * Two Telegram bot tokens
@@ -132,7 +158,14 @@ await test_connection()
 * Depends on Messenger uptime
 * Not built for heavy traffic
 
+<<<<<<< HEAD
 ---
+=======
+- Data is sent as raw binary files through Telegram - **not encrypted** beyond Telegram's own encryption
+- Bot tokens should be kept secret
+- This is a PoC and not intended for production use
+- Consider adding additional encryption for sensitive data
+>>>>>>> 3452a82 (feat: File!)
 
 ## Using Other Messengers
 
@@ -147,6 +180,7 @@ Platforms with different APIs require code changes.
 
 ---
 
+<<<<<<< HEAD
 ## Technical Details
 
 ### Data Flow
@@ -156,6 +190,16 @@ Platforms with different APIs require code changes.
 3. Server bot opens the connection
 4. Data is exchanged using `SEND` and `RECV`
 5. Both sides close the connection with `CLOSE` and `CLOSED`
+=======
+1. User makes an HTTPS request in their browser
+2. Client bot receives the CONNECT request
+3. Client sends `CONNECT {request_id} {host} {port}` to the channel
+4. Server bot picks up the message
+5. Server bot establishes a TCP connection to the target
+6. Server responds with `OK {request_id} {stream_id}`
+7. Data is exchanged using file uploads with `SEND_{stream_id}.bin` and `RECV_{stream_id}.bin` filenames
+8. Connections are closed with `CLOSE`/`CLOSED` commands
+>>>>>>> 3452a82 (feat: File!)
 
 ### Connection Pooling
 

@@ -5,7 +5,7 @@ import logging
 from urllib.parse import urlparse
 
 import re
-from base64 import b64encode, b64decode
+
 
 import telegram
 
@@ -31,6 +31,9 @@ connects = []
 # Proxy settings
 PROXY_HOST = "127.0.0.1"
 PROXY_PORT = 8888
+
+# Buffer/chunk size for data transfer (tune this for performance)
+CHUNK_SIZE = 4096
 
 
 class AsyncBytesIO:
@@ -107,19 +110,19 @@ async def handle_ok(message: telegram.Message):
     class AsyncWriteBuffer:
         def __init__(self):
             self._buffer = b""
-            self._buffer_size = 4096
 
         async def write(self, data):
             self._buffer += data
             # Auto-flush if buffer gets too large
-            if len(self._buffer) >= self._buffer_size:
+            if len(self._buffer) >= CHUNK_SIZE:
                 await self.flush()
 
         async def flush(self):
             if self._buffer:
-                await bot.send_message(
+                await bot.send_document(
                     chat_id=CHAT_ID,
-                    text=f"SEND {stream_id} {b64encode(self._buffer).decode('utf-8')}",
+                    document=self._buffer,
+                    filename=f"SEND_{stream_id}.bin",
                 )
                 self._buffer = b""
 
@@ -136,15 +139,19 @@ async def handle_ok(message: telegram.Message):
 
 
 async def handle_recv(message: telegram.Message):
-    if not message.text:
+    if not message.document:
         return
 
-    group = re.search(r"^RECV (\S+) (\S+)$", message.text)
-    if group is None:
+    filename = message.document.file_name
+    if not filename or not filename.startswith("RECV_"):
         return
 
-    stream_id = group.group(1)
-    data = b64decode(group.group(2))
+    # Parse stream_id from filename: RECV_{stream_id}.bin
+    stream_id = filename[5:-4]  # Remove "RECV_" and ".bin"
+
+    # Download file content
+    file = await message.document.get_file()
+    data = bytes(await file.download_as_bytearray())
 
     if not any(connect[1] == stream_id for connect in connects):
         logger.warning(f"No connection found for stream_id {stream_id}")
@@ -219,7 +226,7 @@ async def forward_data(reader, writer):
     """Forward data from reader to writer"""
     try:
         while True:
-            data = await reader.read(4096)
+            data = await reader.read(CHUNK_SIZE)
             if not data:
                 break
 
