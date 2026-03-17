@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import uuid
 import logging
@@ -28,6 +29,9 @@ connects = []
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "1080"))
 CHUNK_SIZE = 4096
+# Max raw bytes that fit in a text message after base85 encoding
+# Telegram limit is 4096 chars; prefix "SEND {32-char-id} " = 38 chars; base85 is 5:4 ratio
+TEXT_MAX_RAW = 3200
 
 
 class AsyncBytesIO:
@@ -106,11 +110,18 @@ async def handle_ok(message: telegram.Message):
 
         async def flush(self):
             if self._buffer:
-                await bot.send_document(
-                    chat_id=CHAT_ID,
-                    document=self._buffer,
-                    filename=f"SEND_{stream_id}.bin",
-                )
+                if len(self._buffer) <= TEXT_MAX_RAW:
+                    encoded = base64.b85encode(self._buffer).decode()
+                    await bot.send_message(
+                        chat_id=CHAT_ID,
+                        text=f"SEND {stream_id} {encoded}",
+                    )
+                else:
+                    await bot.send_document(
+                        chat_id=CHAT_ID,
+                        document=self._buffer,
+                        filename=f"SEND_{stream_id}.bin",
+                    )
                 self._buffer = b""
 
         async def close(self):
@@ -133,6 +144,23 @@ async def handle_recv(message: telegram.Message):
 
     file = await message.document.get_file()
     data = bytes(await file.download_as_bytearray())
+
+    for c in connects:
+        if c[1] == stream_id:
+            await c[2].write(data)
+            return
+
+
+async def handle_recv_text(message: telegram.Message):
+    if not message.text:
+        return
+
+    group = re.search(r"^RECV (\S+) (\S+)$", message.text)
+    if group is None:
+        return
+
+    stream_id = group.group(1)
+    data = base64.b85decode(group.group(2))
 
     for c in connects:
         if c[1] == stream_id:
@@ -178,6 +206,7 @@ async def run_bot():
                 if message is None:
                     continue
                 await handle_ok(message)
+                await handle_recv_text(message)
                 await handle_recv(message)
                 await handle_close(message)
 

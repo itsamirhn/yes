@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import uuid
 import re
@@ -22,6 +23,7 @@ if not BOT_TOKEN:
     raise ValueError("SERVER_BOT_TOKEN environment variable is required")
 
 CHUNK_SIZE = 4096
+TEXT_MAX_RAW = 3200
 connects = {}
 
 
@@ -66,16 +68,40 @@ async def run():
                             )
                         break
 
-                    await bot.send_document(
-                        chat_id=message.chat.id,
-                        document=data,
-                        filename=f"RECV_{stream_id}.bin",
-                    )
+                    if len(data) <= TEXT_MAX_RAW:
+                        encoded = base64.b85encode(data).decode()
+                        await bot.send_message(
+                            chat_id=message.chat.id,
+                            text=f"RECV {stream_id} {encoded}",
+                        )
+                    else:
+                        await bot.send_document(
+                            chat_id=message.chat.id,
+                            document=data,
+                            filename=f"RECV_{stream_id}.bin",
+                        )
 
             asyncio.create_task(reader())
             await bot.send_message(
                 chat_id=message.chat.id, text=f"OK {request_id} {stream_id}"
             )
+
+        async def handle_send_text(message: telegram.Message):
+            if not message.text:
+                return
+
+            group = re.search(r"^SEND (\S+) (\S+)$", message.text)
+            if group is None:
+                return
+
+            stream_id = group.group(1)
+            if stream_id not in connects:
+                return
+
+            data = base64.b85decode(group.group(2))
+            _, write = connects[stream_id]
+            write.write(data)
+            await write.drain()
 
         async def send(message: telegram.Message):
             if not message.document:
@@ -136,6 +162,7 @@ async def run():
                     if message is None:
                         continue
                     await connect(message)
+                    await handle_send_text(message)
                     await send(message)
                     await close(message)
             except Exception as e:
