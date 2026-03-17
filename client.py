@@ -2,15 +2,12 @@ import asyncio
 import os
 import uuid
 import logging
-from urllib.parse import urlparse
-
 import re
-
 
 import telegram
 
 logging.basicConfig(
-    level=logging.ERROR,
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -28,11 +25,8 @@ if not CHAT_ID:
 bot = telegram.Bot(base_url=BASE_URL, token=BOT_TOKEN)
 connects = []
 
-# Proxy settings
-PROXY_HOST = "127.0.0.1"
-PROXY_PORT = 8888
-
-# Buffer/chunk size for data transfer (tune this for performance)
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "1080"))
 CHUNK_SIZE = 4096
 
 
@@ -52,7 +46,6 @@ class AsyncBytesIO:
             try:
                 data = await asyncio.wait_for(self._queue.get(), timeout=3)
                 if data is None:
-                    # Stream is closed
                     self._closed = True
                     break
                 self._buffer += data
@@ -74,17 +67,14 @@ class AsyncBytesIO:
             await self._queue.put(None)
 
 
-async def open_connection(host: str, port: int):
+async def open_connection():
     request_id = uuid.uuid4().hex
-    await bot.send_message(chat_id=CHAT_ID, text=f"CONNECT {request_id} {host} {port}")
+    await bot.send_message(chat_id=CHAT_ID, text=f"CONNECT {request_id}")
 
-    while not any(request_id == connect[0] for connect in connects):
+    while not any(request_id == c[0] for c in connects):
         await asyncio.sleep(0.001)
 
-    rb, wb = next(
-        (connect[2], connect[3]) for connect in connects if connect[0] == request_id
-    )
-
+    rb, wb = next((c[2], c[3]) for c in connects if c[0] == request_id)
     return rb, wb
 
 
@@ -96,13 +86,11 @@ async def handle_ok(message: telegram.Message):
     if group is None:
         return
 
-    logger.info(f"Received OK message: {message.text}")
-
     request_id = group.group(1)
     stream_id = group.group(2)
+    logger.info(f"OK for request {request_id}, stream {stream_id}")
 
-    if any(request_id == connect[0] for connect in connects):
-        logger.warning(f"Already connected with request_id {request_id}")
+    if any(request_id == c[0] for c in connects):
         return
 
     rb = AsyncBytesIO()
@@ -113,7 +101,6 @@ async def handle_ok(message: telegram.Message):
 
         async def write(self, data):
             self._buffer += data
-            # Auto-flush if buffer gets too large
             if len(self._buffer) >= CHUNK_SIZE:
                 await self.flush()
 
@@ -128,11 +115,7 @@ async def handle_ok(message: telegram.Message):
 
         async def close(self):
             await self.flush()
-            await bot.send_message(
-                chat_id=CHAT_ID,
-                text=f"CLOSE {stream_id}",
-            )
-            logger.info(f"Sent close command for stream_id {stream_id}")
+            await bot.send_message(chat_id=CHAT_ID, text=f"CLOSE {stream_id}")
 
     wb = AsyncWriteBuffer()
     connects.append((request_id, stream_id, rb, wb))
@@ -146,19 +129,15 @@ async def handle_recv(message: telegram.Message):
     if not filename or not filename.startswith("RECV_"):
         return
 
-    # Parse stream_id from filename: RECV_{stream_id}.bin
-    stream_id = filename[5:-4]  # Remove "RECV_" and ".bin"
+    stream_id = filename[5:-4]
 
-    # Download file content
     file = await message.document.get_file()
     data = bytes(await file.download_as_bytearray())
 
-    if not any(connect[1] == stream_id for connect in connects):
-        logger.warning(f"No connection found for stream_id {stream_id}")
-        return
-
-    rb = next(connect[2] for connect in connects if connect[1] == stream_id)
-    await rb.write(data)
+    for c in connects:
+        if c[1] == stream_id:
+            await c[2].write(data)
+            return
 
 
 async def handle_close(message: telegram.Message):
@@ -170,22 +149,14 @@ async def handle_close(message: telegram.Message):
         return
 
     stream_id = group.group(1)
-    logger.info(f"Received close message: {message.text}")
+    logger.info(f"Stream {stream_id} closed by server")
 
-    # Find the connection and close the AsyncBytesIO instance
-    connection_to_close = None
-    for connect in connects:
-        if connect[1] == stream_id:
-            connection_to_close = connect
+    for c in connects:
+        if c[1] == stream_id:
+            await c[2].close()
             break
 
-    if connection_to_close:
-        # Close the AsyncBytesIO instance (rb is at index 2)
-        rb = connection_to_close[2]
-        await rb.close()
-
-    # Remove the connection from the list
-    connects[:] = [connect for connect in connects if connect[1] != stream_id]
+    connects[:] = [c for c in connects if c[1] != stream_id]
 
 
 async def run_bot():
@@ -194,316 +165,85 @@ async def run_bot():
     while True:
         try:
             await asyncio.sleep(0.001)
-
             updates = await bot.get_updates(
-                offset=last_id + 1 if last_id else None,
-                limit=10,
+                offset=last_id + 1 if last_id else None, limit=10
             )
-
             if not updates:
                 continue
 
-            last_id = max(update.update_id for update in updates)
+            last_id = max(u.update_id for u in updates)
 
             for update in updates:
                 message = update.channel_post
-                if message and message.text:
-                    logger.debug(f"Received message: {message.text}")
-
                 if message is None:
                     continue
-
                 await handle_ok(message)
                 await handle_recv(message)
                 await handle_close(message)
 
         except Exception as e:
-            logger.error(f"An error occurred: {e}", exc_info=True)
+            logger.error(f"Bot error: {e}", exc_info=True)
             await asyncio.sleep(0.001)
 
 
-async def forward_data(reader, writer):
-    """Forward data from reader to writer"""
+async def forward_to_writer(reader, writer):
+    """Forward from asyncio.StreamReader or AsyncBytesIO to AsyncWriteBuffer or StreamWriter"""
     try:
         while True:
             data = await reader.read(CHUNK_SIZE)
             if not data:
                 break
-
-            # Check if this is our custom AsyncWriteBuffer or asyncio StreamWriter
             if hasattr(writer, "_buffer"):
-                # Our custom AsyncWriteBuffer - write() is async
                 await writer.write(data)
                 await writer.flush()
             else:
-                # Standard asyncio StreamWriter - write() is not async
                 writer.write(data)
                 await writer.drain()
     except Exception as e:
-        logger.error(f"Error forwarding data: {e}")
+        logger.error(f"Forward error: {e}")
     finally:
         try:
             if hasattr(writer, "_buffer"):
                 await writer.close()
             else:
-                # Standard asyncio StreamWriter
                 writer.close()
-        except:
+        except Exception:
             pass
-
-
-async def handle_http_request(
-    client_reader, client_writer, request_line: str, headers: dict
-):
-    """Handle HTTP request (non-CONNECT)"""
-    try:
-        # Parse the request line
-        method, url, version = request_line.split(" ", 2)
-
-        # Parse the URL to get host and port
-        parsed_url = urlparse(
-            url if url.startswith("http") else f"http://{headers.get('host', '')}{url}"
-        )
-        host = parsed_url.hostname
-        port = parsed_url.port or (443 if parsed_url.scheme == "https" else 80)
-
-        if not host:
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await client_writer.drain()
-            return
-
-        # Connect to target server through telegram bot
-        server_reader, server_writer = await open_connection(host, port)
-
-        # Forward the original request
-        request_data = f"{method} {parsed_url.path or '/'}"
-        if parsed_url.query:
-            request_data += f"?{parsed_url.query}"
-        request_data += f" {version}\r\n"
-
-        # Add headers
-        for header_name, header_value in headers.items():
-            request_data += f"{header_name}: {header_value}\r\n"
-        request_data += "\r\n"
-
-        await server_writer.write(request_data.encode())
-        await server_writer.flush()
-
-        # Start bidirectional forwarding
-        client_to_server = asyncio.create_task(
-            forward_data(client_reader, server_writer)
-        )
-        server_to_client = asyncio.create_task(
-            forward_data(server_reader, client_writer)
-        )
-
-        # Wait for either direction to complete
-        await asyncio.gather(client_to_server, server_to_client, return_exceptions=True)
-
-    except Exception as e:
-        logger.error(f"Error handling HTTP request: {e}")
-        try:
-            client_writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
-            await client_writer.drain()
-        except:
-            pass
-
-
-async def handle_https_connect(client_reader, client_writer, host: str, port: int):
-    """Handle HTTPS CONNECT request"""
-    try:
-        # Connect to target server through telegram bot
-        server_reader, server_writer = await open_connection(host, port)
-
-        # Send connection established response
-        client_writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        await client_writer.drain()
-
-        # Start bidirectional forwarding
-        client_to_server = asyncio.create_task(
-            forward_data(client_reader, server_writer)
-        )
-        server_to_client = asyncio.create_task(
-            forward_data(server_reader, client_writer)
-        )
-
-        # Wait for either direction to complete
-        await asyncio.gather(client_to_server, server_to_client, return_exceptions=True)
-
-    except Exception as e:
-        logger.error(f"Error handling HTTPS CONNECT: {e}")
-        try:
-            client_writer.write(b"HTTP/1.1 500 Internal Server Error\r\n\r\n")
-            await client_writer.drain()
-        except:
-            pass
-
-
-async def handle_socks5_client(client_reader, client_writer, first_byte):
-    """Handle SOCKS5 client connection"""
-    try:
-        # Read remaining greeting (nmethods) - we already read version (0x05)
-        nmethods = (await client_reader.readexactly(1))[0]
-        methods = await client_reader.readexactly(nmethods)
-
-        # Reply with no-auth (0x00)
-        client_writer.write(b'\x05\x00')
-        await client_writer.drain()
-
-        # Read request: VER CMD RSV ATYP
-        request = await client_reader.readexactly(4)
-        ver, cmd, _, atyp = request
-
-        if cmd != 0x01:  # Only CONNECT supported
-            client_writer.write(b'\x05\x07\x00\x01' + b'\x00' * 6)
-            await client_writer.drain()
-            return
-
-        # Parse destination address
-        if atyp == 0x01:  # IPv4
-            addr_bytes = await client_reader.readexactly(4)
-            host = '.'.join(str(b) for b in addr_bytes)
-        elif atyp == 0x03:  # Domain name
-            length = (await client_reader.readexactly(1))[0]
-            host = (await client_reader.readexactly(length)).decode()
-        elif atyp == 0x04:  # IPv6
-            addr_bytes = await client_reader.readexactly(16)
-            host = ':'.join(f'{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}' for i in range(0, 16, 2))
-        else:
-            client_writer.write(b'\x05\x08\x00\x01' + b'\x00' * 6)
-            await client_writer.drain()
-            return
-
-        port_bytes = await client_reader.readexactly(2)
-        port = int.from_bytes(port_bytes, 'big')
-
-        logger.info(f"SOCKS5 CONNECT to {host}:{port}")
-
-        # Connect via Telegram tunnel
-        server_reader, server_writer = await open_connection(host, port)
-
-        # Success reply
-        client_writer.write(b'\x05\x00\x00\x01' + b'\x00' * 6)
-        await client_writer.drain()
-
-        # Relay data bidirectionally
-        await asyncio.gather(
-            forward_data(client_reader, server_writer),
-            forward_data(server_reader, client_writer),
-            return_exceptions=True
-        )
-    except Exception as e:
-        logger.error(f"SOCKS5 error: {e}")
 
 
 async def handle_client(client_reader, client_writer):
-    """Handle incoming client connection (HTTP/HTTPS or SOCKS5)"""
+    """Accept a TCP connection and tunnel it through Telegram"""
     try:
-        # Read first byte to detect protocol
-        first_byte = await client_reader.readexactly(1)
-        if not first_byte:
-            return
+        server_reader, server_writer = await open_connection()
 
-        if first_byte[0] == 0x05:
-            # SOCKS5 protocol
-            await handle_socks5_client(client_reader, client_writer, first_byte)
-            return
+        client_to_server = asyncio.create_task(
+            forward_to_writer(client_reader, server_writer)
+        )
+        server_to_client = asyncio.create_task(
+            forward_to_writer(server_reader, client_writer)
+        )
 
-        # HTTP/HTTPS - read rest of first line
-        rest_of_line = await client_reader.readline()
-        request_line = (first_byte + rest_of_line).decode().strip()
-
-        # Read headers
-        headers = {}
-        while True:
-            line = await client_reader.readline()
-            if not line or line == b"\r\n":
-                break
-
-            line = line.decode().strip()
-            if ":" in line:
-                key, value = line.split(":", 1)
-                headers[key.strip().lower()] = value.strip()
-
-        # Parse request
-        parts = request_line.split(" ")
-        if len(parts) < 3:
-            client_writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-            await client_writer.drain()
-            return
-
-        method = parts[0].upper()
-
-        if method == "CONNECT":
-            # HTTPS tunnel
-            host_port = parts[1]
-            if ":" in host_port:
-                host, port_str = host_port.split(":", 1)
-                port = int(port_str)
-            else:
-                host = host_port
-                port = 443
-
-            await handle_https_connect(client_reader, client_writer, host, port)
-        else:
-            # HTTP request
-            await handle_http_request(
-                client_reader, client_writer, request_line, headers
-            )
-
+        await asyncio.gather(client_to_server, server_to_client, return_exceptions=True)
     except Exception as e:
-        logger.error(f"Error handling client: {e}")
+        logger.error(f"Client handler error: {e}")
     finally:
         try:
             client_writer.close()
-        except:
+        except Exception:
             pass
 
 
-async def run_proxy():
-    """Run the HTTP/HTTPS/SOCKS5 proxy server"""
-    server = await asyncio.start_server(handle_client, PROXY_HOST, PROXY_PORT)
-
-    print(f"Proxy server running on {PROXY_HOST}:{PROXY_PORT}")
-    print(f"Supports HTTP, HTTPS, and SOCKS5 proxy on the same port")
-
-    async with server:
-        await server.serve_forever()
-
-
-async def test_connection():
-    rb, wb = await open_connection("httpbin.org", 80)
-
-    await wb.write(b"GET / HTTP/1.1\r\nHost: httpbin.org\r\n\r\n")
-    await wb.flush()
-
-    data = b""
-    while True:
-        chunk = await rb.read(4096)
-        if not chunk:
-            break
-        data += chunk
-
-    print("Received data:")
-    print(data.decode("utf-8"))
-
-
 async def main():
-    print("Starting Telegram Bot Proxy...")
+    print(f"Starting tunnel client on {LISTEN_HOST}:{LISTEN_PORT}")
 
-    # Start bot in background
     bot_task = asyncio.create_task(run_bot())
     await asyncio.sleep(2)
 
-    # Test the connection first
-    # print("Testing connection...")
-    # await test_connection()
+    server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
+    print(f"Tunnel listening on {LISTEN_HOST}:{LISTEN_PORT}")
 
-    # Start proxy server
-    proxy_task = asyncio.create_task(run_proxy())
-
-    # Keep both running
-    await asyncio.gather(bot_task, proxy_task, return_exceptions=True)
+    async with server:
+        await asyncio.gather(bot_task, server.serve_forever(), return_exceptions=True)
 
 
 if __name__ == "__main__":
