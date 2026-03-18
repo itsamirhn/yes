@@ -79,10 +79,19 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 	}
 
 	raw := PackFrames(frames)
+	compressed := Compress(raw)
 
-	if len(raw) <= TextMaxRaw {
-		encoded := string(base85.Encode(raw))
-		err := q.client.SendMessage(ctx, chatID, q.prefix+" "+encoded)
+	// Use compressed if it's actually smaller
+	payload := raw
+	suffix := ""
+	if len(compressed) < len(raw) {
+		payload = compressed
+		suffix = ".z"
+	}
+
+	if len(payload) <= TextMaxRaw {
+		encoded := string(base85.Encode(payload))
+		err := q.client.SendMessage(ctx, chatID, q.prefix+suffix+" "+encoded)
 		if err != nil {
 			log.Printf("SendQueue: sendMessage error: %v", err)
 		}
@@ -90,7 +99,7 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 	}
 
 	if q.enableFiles {
-		err := q.client.SendDocument(ctx, chatID, raw, q.prefix+".bin")
+		err := q.client.SendDocument(ctx, chatID, payload, q.prefix+suffix+".bin")
 		if err != nil {
 			log.Printf("SendQueue: sendDocument error: %v", err)
 		}
@@ -100,9 +109,16 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 	// Split into individual text frames
 	for _, f := range frames {
 		chunkRaw := PackFrames([]Frame{f})
-		if len(chunkRaw) <= TextMaxRaw {
-			encoded := string(base85.Encode(chunkRaw))
-			err := q.client.SendMessage(ctx, chatID, q.prefix+" "+encoded)
+		chunkCompressed := Compress(chunkRaw)
+		chunkPayload := chunkRaw
+		chunkSuffix := ""
+		if len(chunkCompressed) < len(chunkRaw) {
+			chunkPayload = chunkCompressed
+			chunkSuffix = ".z"
+		}
+		if len(chunkPayload) <= TextMaxRaw {
+			encoded := string(base85.Encode(chunkPayload))
+			err := q.client.SendMessage(ctx, chatID, q.prefix+chunkSuffix+" "+encoded)
 			if err != nil {
 				log.Printf("SendQueue: sendMessage error: %v", err)
 			}

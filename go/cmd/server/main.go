@@ -20,6 +20,7 @@ import (
 var (
 	reCONNECT = regexp.MustCompile(`^CONNECT (\S+)$`)
 	reSEND    = regexp.MustCompile(`^SEND (\S+)$`)
+	reSENDZ   = regexp.MustCompile(`^SEND\.z (\S+)$`)
 	reCLOSE   = regexp.MustCompile(`^CLOSE (\S+)$`)
 )
 
@@ -137,7 +138,23 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, sq *
 			return
 		}
 
-		// SEND text
+		// SEND.z text (compressed)
+		if m := reSENDZ.FindStringSubmatch(msg.Text); m != nil {
+			compressed, err := base85.Decode([]byte(m[1]))
+			if err != nil {
+				log.Printf("base85 decode error: %v", err)
+				return
+			}
+			raw, err := mux.Decompress(compressed)
+			if err != nil {
+				log.Printf("decompress error: %v", err)
+				return
+			}
+			writeToUpstream(raw)
+			return
+		}
+
+		// SEND text (uncompressed)
 		if m := reSEND.FindStringSubmatch(msg.Text); m != nil {
 			raw, err := base85.Decode([]byte(m[1]))
 			if err != nil {
@@ -166,15 +183,25 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, sq *
 		}
 	}
 
-	// SEND.bin file
-	if filesEnabled && msg.Document != nil && msg.Document.FileName == "SEND.bin" {
-		raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
-		if err != nil {
-			log.Printf("Download document error: %v", err)
+	// SEND.bin / SEND.z.bin file
+	if filesEnabled && msg.Document != nil {
+		fn := msg.Document.FileName
+		if fn == "SEND.bin" || fn == "SEND.z.bin" {
+			raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
+			if err != nil {
+				log.Printf("Download document error: %v", err)
+				return
+			}
+			if fn == "SEND.z.bin" {
+				raw, err = mux.Decompress(raw)
+				if err != nil {
+					log.Printf("decompress error: %v", err)
+					return
+				}
+			}
+			writeToUpstream(raw)
 			return
 		}
-		writeToUpstream(raw)
-		return
 	}
 }
 

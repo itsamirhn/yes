@@ -19,6 +19,7 @@ import (
 var (
 	reOK     = regexp.MustCompile(`^OK (\S+) (\S+)$`)
 	reRECV   = regexp.MustCompile(`^RECV (\S+)$`)
+	reRECVZ  = regexp.MustCompile(`^RECV\.z (\S+)$`)
 	reCLOSED = regexp.MustCompile(`^CLOSED (\S+)$`)
 )
 
@@ -209,7 +210,23 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, file
 			return
 		}
 
-		// RECV text
+		// RECV.z text (compressed)
+		if m := reRECVZ.FindStringSubmatch(msg.Text); m != nil {
+			compressed, err := base85.Decode([]byte(m[1]))
+			if err != nil {
+				log.Printf("base85 decode error: %v", err)
+				return
+			}
+			raw, err := mux.Decompress(compressed)
+			if err != nil {
+				log.Printf("decompress error: %v", err)
+				return
+			}
+			dispatchFrames(raw)
+			return
+		}
+
+		// RECV text (uncompressed)
 		if m := reRECV.FindStringSubmatch(msg.Text); m != nil {
 			raw, err := base85.Decode([]byte(m[1]))
 			if err != nil {
@@ -237,15 +254,25 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, file
 		}
 	}
 
-	// RECV.bin file
-	if filesEnabled && msg.Document != nil && msg.Document.FileName == "RECV.bin" {
-		raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
-		if err != nil {
-			log.Printf("Download document error: %v", err)
+	// RECV.bin / RECV.z.bin file
+	if filesEnabled && msg.Document != nil {
+		fn := msg.Document.FileName
+		if fn == "RECV.bin" || fn == "RECV.z.bin" {
+			raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
+			if err != nil {
+				log.Printf("Download document error: %v", err)
+				return
+			}
+			if fn == "RECV.z.bin" {
+				raw, err = mux.Decompress(raw)
+				if err != nil {
+					log.Printf("decompress error: %v", err)
+					return
+				}
+			}
+			dispatchFrames(raw)
 			return
 		}
-		dispatchFrames(raw)
-		return
 	}
 }
 
