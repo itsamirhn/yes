@@ -6,11 +6,16 @@ services:
   server:
     build: .
     command: uv run python server.py
+    ports:
+      - "8444:8443"
     environment:
       SERVER_BOT_TOKEN: ${SERVER_BOT_TOKEN}
       BASE_URL: "https://api.telegram.org/bot"
       UPSTREAM_HOST: "socks-proxy"
       UPSTREAM_PORT: "1080"
+      SERVER_WEBHOOK_URL: ${SERVER_WEBHOOK_URL:-}
+      SERVER_WEBHOOK_PORT: "8443"
+      ENABLE_FILES: ${ENABLE_FILES:-}
     depends_on:
       - socks-proxy
 
@@ -19,11 +24,15 @@ services:
     command: uv run python client.py
     ports:
       - "1080:1080"
+      - "8443:8443"
     environment:
       CLIENT_BOT_TOKEN: ${CLIENT_BOT_TOKEN}
       CHAT_ID: ${CHAT_ID}
       BASE_URL: "https://api.telegram.org/bot"
       LISTEN_HOST: "0.0.0.0"
       LISTEN_PORT: "1080"
+      CLIENT_WEBHOOK_URL: ${CLIENT_WEBHOOK_URL:-}
+      CLIENT_WEBHOOK_PORT: "8443"
+      ENABLE_FILES: ${ENABLE_FILES:-}
     depends_on:
       - server
