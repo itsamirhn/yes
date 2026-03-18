@@ -11,10 +11,18 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"yes/internal/base85"
 	"yes/internal/mux"
 	"yes/internal/tg"
 )
+
+var rrIdx uint64
+
+func rrClient(clients []*tg.Client) *tg.Client {
+	i := atomic.AddUint64(&rrIdx, 1)
+	return clients[i%uint64(len(clients))]
+}
 
 var (
 	reOK     = regexp.MustCompile(`^OK (\S+) (\S+)$`)
@@ -44,8 +52,8 @@ func envOr(key, def string) string {
 }
 
 func main() {
-	botToken := os.Getenv("CLIENT_BOT_TOKEN")
-	if botToken == "" {
+	tokenStr := os.Getenv("CLIENT_BOT_TOKEN")
+	if tokenStr == "" {
 		log.Fatal("CLIENT_BOT_TOKEN is required")
 	}
 	chatID := os.Getenv("CHAT_ID")
@@ -60,9 +68,20 @@ func main() {
 	enableFiles := strings.ToLower(os.Getenv("ENABLE_FILES"))
 	filesEnabled := enableFiles == "1" || enableFiles == "true" || enableFiles == "yes"
 
+	var clients []*tg.Client
+	for _, tok := range strings.Split(tokenStr, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok != "" {
+			clients = append(clients, tg.NewClient(tok, baseURL))
+		}
+	}
+	if len(clients) == 0 {
+		log.Fatal("CLIENT_BOT_TOKEN: no valid tokens")
+	}
+	log.Printf("Loaded %d client bot(s)", len(clients))
+
 	ctx := context.Background()
-	client := tg.NewClient(botToken, baseURL)
-	sq := mux.NewSendQueue(client, chatID, "SEND", filesEnabled)
+	sq := mux.NewSendQueue(clients, chatID, "SEND", filesEnabled)
 	sq.Start(ctx)
 
 	chunkSize := 3100
@@ -73,12 +92,15 @@ func main() {
 	log.Printf("Starting tunnel client on %s:%s", listenHost, listenPort)
 	log.Printf("File transfers: %v", filesEnabled)
 
+	// Use first client for receiving (it sees all channel messages)
+	pollClient := clients[0]
+
 	if webhookURL != "" {
 		log.Printf("Mode: webhook")
-		go runWebhook(ctx, client, botToken, webhookURL, webhookPort, filesEnabled)
+		go runWebhook(ctx, pollClient, pollClient.Token, webhookURL, webhookPort, filesEnabled)
 	} else {
 		log.Printf("Mode: polling")
-		go runPolling(ctx, client, filesEnabled)
+		go runPolling(ctx, pollClient, filesEnabled)
 	}
 
 	ln, err := net.Listen("tcp", listenHost+":"+listenPort)
@@ -93,14 +115,14 @@ func main() {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-		go handleClient(ctx, conn, client, chatID, sq, chunkSize)
+		go handleClient(ctx, conn, clients, chatID, sq, chunkSize)
 	}
 }
 
-func handleClient(ctx context.Context, conn net.Conn, client *tg.Client, chatID string, sq *mux.SendQueue, chunkSize int) {
+func handleClient(ctx context.Context, conn net.Conn, clients []*tg.Client, chatID string, sq *mux.SendQueue, chunkSize int) {
 	defer conn.Close()
 
-	buf, streamID, err := openConnection(ctx, client, chatID)
+	buf, streamID, err := openConnection(ctx, clients, chatID)
 	if err != nil {
 		log.Printf("openConnection error: %v", err)
 		return
@@ -129,7 +151,7 @@ func handleClient(ctx context.Context, conn net.Conn, client *tg.Client, chatID 
 				break
 			}
 		}
-		client.SendMessage(ctx, chatID, "CLOSE "+streamID)
+		rrClient(clients).SendMessage(ctx, chatID, "CLOSE "+streamID)
 	}()
 
 	// streambuffer → client TCP
@@ -155,7 +177,7 @@ func handleClient(ctx context.Context, conn net.Conn, client *tg.Client, chatID 
 	streamsMu.Unlock()
 }
 
-func openConnection(ctx context.Context, client *tg.Client, chatID string) (*mux.StreamBuffer, string, error) {
+func openConnection(ctx context.Context, clients []*tg.Client, chatID string) (*mux.StreamBuffer, string, error) {
 	requestID := newRequestID()
 
 	ch := make(chan connectResult, 1)
@@ -163,7 +185,7 @@ func openConnection(ctx context.Context, client *tg.Client, chatID string) (*mux
 	connects[requestID] = ch
 	connectsMu.Unlock()
 
-	err := client.SendMessage(ctx, chatID, "CONNECT "+requestID)
+	err := rrClient(clients).SendMessage(ctx, chatID, "CONNECT "+requestID)
 	if err != nil {
 		connectsMu.Lock()
 		delete(connects, requestID)
@@ -187,7 +209,7 @@ func newRequestID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, filesEnabled bool) {
+func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, filesEnabled bool) {
 	if msg == nil {
 		return
 	}
@@ -258,7 +280,7 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, file
 	if filesEnabled && msg.Document != nil {
 		fn := msg.Document.FileName
 		if fn == "RECV.bin" || fn == "RECV.z.bin" {
-			raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
+			raw, err := pollClient.DownloadDocument(ctx, msg.Document.FileID)
 			if err != nil {
 				log.Printf("Download document error: %v", err)
 				return
@@ -287,10 +309,10 @@ func dispatchFrames(raw []byte) {
 	}
 }
 
-func runPolling(ctx context.Context, client *tg.Client, filesEnabled bool) {
+func runPolling(ctx context.Context, pollClient *tg.Client, filesEnabled bool) {
 	var offset *int
 	for {
-		updates, err := client.GetUpdates(ctx, offset, 10)
+		updates, err := pollClient.GetUpdates(ctx, offset, 10)
 		if err != nil {
 			log.Printf("GetUpdates error: %v", err)
 			continue
@@ -299,22 +321,22 @@ func runPolling(ctx context.Context, client *tg.Client, filesEnabled bool) {
 			newOff := u.UpdateID + 1
 			offset = &newOff
 			if u.ChannelPost != nil {
-				handleMessage(ctx, u.ChannelPost, client, filesEnabled)
+				handleMessage(ctx, u.ChannelPost, pollClient, filesEnabled)
 			}
 		}
 	}
 }
 
-func runWebhook(ctx context.Context, client *tg.Client, botToken, webhookURL, webhookPort string, filesEnabled bool) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/"+botToken, func(w http.ResponseWriter, r *http.Request) {
+func runWebhook(ctx context.Context, pollClient *tg.Client, botToken, webhookURL, webhookPort string, filesEnabled bool) {
+	httpMux := http.NewServeMux()
+	httpMux.HandleFunc("/"+botToken, func(w http.ResponseWriter, r *http.Request) {
 		var update tg.Update
 		if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 			http.Error(w, "bad request", 400)
 			return
 		}
 		if update.ChannelPost != nil {
-			handleMessage(ctx, update.ChannelPost, client, filesEnabled)
+			handleMessage(ctx, update.ChannelPost, pollClient, filesEnabled)
 		}
 		w.Write([]byte("ok"))
 	})
@@ -322,12 +344,12 @@ func runWebhook(ctx context.Context, client *tg.Client, botToken, webhookURL, we
 	addr := "0.0.0.0:" + webhookPort
 	log.Printf("Webhook server listening on %s", addr)
 
-	err := client.SetWebhook(ctx, webhookURL+"/"+botToken)
+	err := pollClient.SetWebhook(ctx, webhookURL+"/"+botToken)
 	if err != nil {
 		log.Printf("SetWebhook error: %v", err)
 	} else {
 		log.Printf("Webhook set to %s/%s", webhookURL, botToken)
 	}
 
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.ListenAndServe(addr, httpMux))
 }

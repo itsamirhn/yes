@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"sync"
+	"sync/atomic"
 	"yes/internal/base85"
 	"yes/internal/tg"
 )
@@ -12,21 +13,27 @@ const TextMaxRaw = 3200
 
 type SendQueue struct {
 	ch          chan Frame
-	client      *tg.Client
+	clients     []*tg.Client
+	idx         uint64
 	chatID      string
 	mu          sync.Mutex
 	prefix      string
 	enableFiles bool
 }
 
-func NewSendQueue(client *tg.Client, chatID, prefix string, enableFiles bool) *SendQueue {
+func NewSendQueue(clients []*tg.Client, chatID, prefix string, enableFiles bool) *SendQueue {
 	return &SendQueue{
 		ch:          make(chan Frame, 4096),
-		client:      client,
+		clients:     clients,
 		chatID:      chatID,
 		prefix:      prefix,
 		enableFiles: enableFiles,
 	}
+}
+
+func (q *SendQueue) nextClient() *tg.Client {
+	i := atomic.AddUint64(&q.idx, 1)
+	return q.clients[i%uint64(len(q.clients))]
 }
 
 func (q *SendQueue) SetChatID(id string) {
@@ -91,7 +98,7 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 
 	if len(payload) <= TextMaxRaw {
 		encoded := string(base85.Encode(payload))
-		err := q.client.SendMessage(ctx, chatID, q.prefix+suffix+" "+encoded)
+		err := q.nextClient().SendMessage(ctx, chatID, q.prefix+suffix+" "+encoded)
 		if err != nil {
 			log.Printf("SendQueue: sendMessage error: %v", err)
 		}
@@ -99,7 +106,7 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 	}
 
 	if q.enableFiles {
-		err := q.client.SendDocument(ctx, chatID, payload, q.prefix+suffix+".bin")
+		err := q.nextClient().SendDocument(ctx, chatID, payload, q.prefix+suffix+".bin")
 		if err != nil {
 			log.Printf("SendQueue: sendDocument error: %v", err)
 		}
@@ -118,7 +125,7 @@ func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 		}
 		if len(chunkPayload) <= TextMaxRaw {
 			encoded := string(base85.Encode(chunkPayload))
-			err := q.client.SendMessage(ctx, chatID, q.prefix+chunkSuffix+" "+encoded)
+			err := q.nextClient().SendMessage(ctx, chatID, q.prefix+chunkSuffix+" "+encoded)
 			if err != nil {
 				log.Printf("SendQueue: sendMessage error: %v", err)
 			}

@@ -12,10 +12,18 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"yes/internal/base85"
 	"yes/internal/mux"
 	"yes/internal/tg"
 )
+
+var rrIdx uint64
+
+func rrClient(clients []*tg.Client) *tg.Client {
+	i := atomic.AddUint64(&rrIdx, 1)
+	return clients[i%uint64(len(clients))]
+}
 
 var (
 	reCONNECT = regexp.MustCompile(`^CONNECT (\S+)$`)
@@ -41,8 +49,8 @@ func envOr(key, def string) string {
 }
 
 func main() {
-	botToken := os.Getenv("SERVER_BOT_TOKEN")
-	if botToken == "" {
+	tokenStr := os.Getenv("SERVER_BOT_TOKEN")
+	if tokenStr == "" {
 		log.Fatal("SERVER_BOT_TOKEN is required")
 	}
 	baseURL := envOr("BASE_URL", "https://api.telegram.org/bot")
@@ -53,9 +61,20 @@ func main() {
 	enableFiles := strings.ToLower(os.Getenv("ENABLE_FILES"))
 	filesEnabled := enableFiles == "1" || enableFiles == "true" || enableFiles == "yes"
 
+	var clients []*tg.Client
+	for _, tok := range strings.Split(tokenStr, ",") {
+		tok = strings.TrimSpace(tok)
+		if tok != "" {
+			clients = append(clients, tg.NewClient(tok, baseURL))
+		}
+	}
+	if len(clients) == 0 {
+		log.Fatal("SERVER_BOT_TOKEN: no valid tokens")
+	}
+	log.Printf("Loaded %d server bot(s)", len(clients))
+
 	ctx := context.Background()
-	client := tg.NewClient(botToken, baseURL)
-	sq := mux.NewSendQueue(client, "", "RECV", filesEnabled)
+	sq := mux.NewSendQueue(clients, "", "RECV", filesEnabled)
 	sq.Start(ctx)
 
 	chunkSize := 3100
@@ -66,16 +85,19 @@ func main() {
 	log.Printf("File transfers: %v", filesEnabled)
 	log.Printf("Upstream: %s:%s", upstreamHost, upstreamPort)
 
+	// Use first client for receiving
+	pollClient := clients[0]
+
 	if webhookURL != "" {
 		log.Printf("Mode: webhook")
-		runWebhook(ctx, client, sq, botToken, webhookURL, webhookPort, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+		runWebhook(ctx, pollClient, clients, sq, pollClient.Token, webhookURL, webhookPort, upstreamHost, upstreamPort, filesEnabled, chunkSize)
 	} else {
 		log.Printf("Mode: polling")
-		runPolling(ctx, client, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+		runPolling(ctx, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
 	}
 }
 
-func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
 	if msg == nil {
 		return
 	}
@@ -128,13 +150,13 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, sq *
 						connsMu.Lock()
 						delete(conns, streamID)
 						connsMu.Unlock()
-						client.SendMessage(ctx, chatID, "CLOSED "+streamID)
+						rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
 						return
 					}
 				}
 			}()
 
-			client.SendMessage(ctx, chatID, fmt.Sprintf("OK %s %s", requestID, streamID))
+			rrClient(clients).SendMessage(ctx, chatID, fmt.Sprintf("OK %s %s", requestID, streamID))
 			return
 		}
 
@@ -177,17 +199,17 @@ func handleMessage(ctx context.Context, msg *tg.Message, client *tg.Client, sq *
 			connsMu.Unlock()
 			if ok {
 				conn.Close()
-				client.SendMessage(ctx, chatID, "CLOSED "+streamID)
+				rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
 			}
 			return
 		}
 	}
 
-	// SEND.bin / SEND.z.bin file
+	// SEND.bin / SEND.z.bin file — use pollClient for downloads
 	if filesEnabled && msg.Document != nil {
 		fn := msg.Document.FileName
 		if fn == "SEND.bin" || fn == "SEND.z.bin" {
-			raw, err := client.DownloadDocument(ctx, msg.Document.FileID)
+			raw, err := pollClient.DownloadDocument(ctx, msg.Document.FileID)
 			if err != nil {
 				log.Printf("Download document error: %v", err)
 				return
@@ -224,10 +246,10 @@ func newStreamID() string {
 	return fmt.Sprintf("%x", b)
 }
 
-func runPolling(ctx context.Context, client *tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func runPolling(ctx context.Context, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
 	var offset *int
 	for {
-		updates, err := client.GetUpdates(ctx, offset, 10)
+		updates, err := pollClient.GetUpdates(ctx, offset, 10)
 		if err != nil {
 			log.Printf("GetUpdates error: %v", err)
 			continue
@@ -236,13 +258,13 @@ func runPolling(ctx context.Context, client *tg.Client, sq *mux.SendQueue, upstr
 			newOff := u.UpdateID + 1
 			offset = &newOff
 			if u.ChannelPost != nil {
-				handleMessage(ctx, u.ChannelPost, client, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+				handleMessage(ctx, u.ChannelPost, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
 			}
 		}
 	}
 }
 
-func runWebhook(ctx context.Context, client *tg.Client, sq *mux.SendQueue, botToken, webhookURL, webhookPort, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func runWebhook(ctx context.Context, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, botToken, webhookURL, webhookPort, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/"+botToken, func(w http.ResponseWriter, r *http.Request) {
 		var update tg.Update
@@ -251,7 +273,7 @@ func runWebhook(ctx context.Context, client *tg.Client, sq *mux.SendQueue, botTo
 			return
 		}
 		if update.ChannelPost != nil {
-			handleMessage(ctx, update.ChannelPost, client, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+			handleMessage(ctx, update.ChannelPost, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
 		}
 		w.Write([]byte("ok"))
 	})
@@ -259,7 +281,7 @@ func runWebhook(ctx context.Context, client *tg.Client, sq *mux.SendQueue, botTo
 	addr := "0.0.0.0:" + webhookPort
 	log.Printf("Webhook server listening on %s", addr)
 
-	err := client.SetWebhook(ctx, webhookURL+"/"+botToken)
+	err := pollClient.SetWebhook(ctx, webhookURL+"/"+botToken)
 	if err != nil {
 		log.Printf("SetWebhook error: %v", err)
 	} else {
