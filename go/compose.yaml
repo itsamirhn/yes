@@ -10,7 +10,7 @@ services:
       - "8444:8443"
     environment:
       SERVER_BOT_TOKEN: ${SERVER_BOT_TOKEN}  # comma-separated for multi-bot
-      BASE_URL: "https://api.telegram.org/bot"
+      BASE_URL: ${BASE_URL:-https://api.telegram.org/bot}
       UPSTREAM_HOST: "socks-proxy"
       UPSTREAM_PORT: "1080"
       SERVER_WEBHOOK_URL: ${SERVER_WEBHOOK_URL:-}
@@ -28,7 +28,7 @@ services:
     environment:
       CLIENT_BOT_TOKEN: ${CLIENT_BOT_TOKEN}  # comma-separated for multi-bot
       CHAT_ID: ${CHAT_ID}
-      BASE_URL: "https://api.telegram.org/bot"
+      BASE_URL: ${BASE_URL:-https://api.telegram.org/bot}
       LISTEN_HOST: "0.0.0.0"
       LISTEN_PORT: "1080"
       CLIENT_WEBHOOK_URL: ${CLIENT_WEBHOOK_URL:-}

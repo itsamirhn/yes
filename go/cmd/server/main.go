@@ -9,37 +9,17 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 	"sync"
-	"sync/atomic"
-	"yes/internal/base85"
-	"yes/internal/mux"
+	"time"
 	"yes/internal/tg"
+	"yes/internal/transport"
+
+	kcp "github.com/xtaci/kcp-go/v5"
+	"github.com/xtaci/smux"
 )
 
-var rrIdx uint64
-
-func rrClient(clients []*tg.Client) *tg.Client {
-	i := atomic.AddUint64(&rrIdx, 1)
-	return clients[i%uint64(len(clients))]
-}
-
-var (
-	reCONNECT = regexp.MustCompile(`^CONNECT (\S+)$`)
-	reSEND    = regexp.MustCompile(`^SEND (\S+)$`)
-	reSENDZ   = regexp.MustCompile(`^SEND\.z (\S+)$`)
-	reCLOSE   = regexp.MustCompile(`^CLOSE (\S+)$`)
-)
-
-var (
-	connsMu sync.Mutex
-	conns   = map[string]net.Conn{}
-
-	// Track seen request IDs to avoid duplicate handling
-	seenMu sync.Mutex
-	seen   = map[string]bool{}
-)
+var serverDecoder = transport.NewDecoder("C") // server receives "C" prefix
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -72,182 +52,123 @@ func main() {
 		log.Fatal("SERVER_BOT_TOKEN: no valid tokens")
 	}
 	log.Printf("Loaded %d server bot(s)", len(clients))
-
-	ctx := context.Background()
-	sq := mux.NewSendQueue(clients, "", "RECV", filesEnabled)
-	sq.Start(ctx)
-
-	chunkSize := 3100
-	if filesEnabled {
-		chunkSize = 4096
-	}
-
 	log.Printf("File transfers: %v", filesEnabled)
 	log.Printf("Upstream: %s:%s", upstreamHost, upstreamPort)
 
-	// Use first client for receiving
+	ctx := context.Background()
 	pollClient := clients[0]
+
+	// TelegramPacketConn — server sends "S", receives "C"; chatID set after HELLO
+	tgConn := transport.NewTelegramPacketConn(ctx, clients, "", filesEnabled, "S")
+
+	// Wait for HELLO to learn the chatID
+	helloCh := make(chan string, 1)
 
 	if webhookURL != "" {
 		log.Printf("Mode: webhook")
-		runWebhook(ctx, pollClient, clients, sq, pollClient.Token, webhookURL, webhookPort, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+		go runWebhook(ctx, pollClient, tgConn, helloCh, pollClient.Token, webhookURL, webhookPort, filesEnabled)
 	} else {
 		log.Printf("Mode: polling")
-		runPolling(ctx, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+		go runPolling(ctx, pollClient, tgConn, helloCh, filesEnabled)
+	}
+
+	log.Printf("Waiting for client HELLO...")
+	chatID := <-helloCh
+	log.Printf("Got HELLO from chat %s", chatID)
+	tgConn.SetChatID(chatID)
+
+	// Reply READY
+	if err := transport.SendControl(ctx, clients[0], chatID, "READY"); err != nil {
+		log.Fatalf("Failed to send READY: %v", err)
+	}
+
+	// Create KCP listener on top of TelegramPacketConn (nil block = no encryption overhead)
+	kcpListener, err := kcp.ServeConn(nil, 0, 0, tgConn)
+	if err != nil {
+		log.Fatalf("KCP ServeConn error: %v", err)
+	}
+	log.Printf("KCP listener ready, waiting for client connection...")
+
+	kcpConn, err := kcpListener.AcceptKCP()
+	if err != nil {
+		log.Fatalf("KCP AcceptKCP error: %v", err)
+	}
+	log.Printf("KCP session established")
+
+	kcpConn.SetNoDelay(1, 50, 2, 1)
+	kcpConn.SetWindowSize(256, 256)
+	kcpConn.SetMtu(1400)
+	kcpConn.SetStreamMode(true)
+	kcpConn.SetACKNoDelay(true)
+
+	// smux server session — high timeouts for Telegram latency
+	smuxConfig := smux.DefaultConfig()
+	smuxConfig.MaxReceiveBuffer = 4 * 1024 * 1024
+	smuxConfig.MaxStreamBuffer = 2 * 1024 * 1024
+	smuxConfig.KeepAliveInterval = 10 * time.Second
+	smuxConfig.KeepAliveTimeout = 300 * time.Second
+	session, err := smux.Server(kcpConn, smuxConfig)
+	if err != nil {
+		log.Fatalf("smux Server error: %v", err)
+	}
+	log.Printf("smux session ready, accepting streams...")
+
+	upstream := upstreamHost + ":" + upstreamPort
+	for {
+		stream, err := session.AcceptStream()
+		if err != nil {
+			log.Printf("smux AcceptStream error: %v", err)
+			break
+		}
+		go handleStream(stream, upstream)
 	}
 }
 
-func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func handleStream(stream *smux.Stream, upstream string) {
+	defer stream.Close()
+	conn, err := net.Dial("tcp", upstream)
+	if err != nil {
+		log.Printf("Upstream dial error: %v", err)
+		return
+	}
+	defer conn.Close()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		io.Copy(conn, stream)
+	}()
+	go func() {
+		defer wg.Done()
+		io.Copy(stream, conn)
+	}()
+	wg.Wait()
+}
+
+func routeMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, tgConn *transport.TelegramPacketConn, helloCh chan string, helloSent *bool, filesEnabled bool) {
 	if msg == nil {
 		return
 	}
 
-	chatID := fmt.Sprintf("%d", msg.Chat.ID)
-
-	if msg.Text != "" {
-		// CONNECT
-		if m := reCONNECT.FindStringSubmatch(msg.Text); m != nil {
-			requestID := m[1]
-
-			seenMu.Lock()
-			if seen[requestID] {
-				seenMu.Unlock()
-				return
-			}
-			seen[requestID] = true
-			seenMu.Unlock()
-
-			log.Printf("New tunnel request %s, connecting to %s:%s", requestID, upstreamHost, upstreamPort)
-			streamID := newStreamID()
-
-			conn, err := net.Dial("tcp", upstreamHost+":"+upstreamPort)
-			if err != nil {
-				log.Printf("Failed to connect to upstream: %v", err)
-				return
-			}
-
-			connsMu.Lock()
-			conns[streamID] = conn
-			connsMu.Unlock()
-
-			sq.SetChatID(chatID)
-
-			// Reader goroutine: upstream → sendqueue
-			go func() {
-				buf := make([]byte, chunkSize)
-				for {
-					n, err := conn.Read(buf)
-					if n > 0 {
-						data := make([]byte, n)
-						copy(data, buf[:n])
-						sq.Push(streamID, data)
-					}
-					if err != nil {
-						if err != io.EOF {
-							log.Printf("Upstream read error for %s: %v", streamID, err)
-						}
-						log.Printf("Upstream closed for stream %s", streamID)
-						connsMu.Lock()
-						delete(conns, streamID)
-						connsMu.Unlock()
-						rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
-						return
-					}
-				}
-			}()
-
-			rrClient(clients).SendMessage(ctx, chatID, fmt.Sprintf("OK %s %s", requestID, streamID))
-			return
-		}
-
-		// SEND.z text (compressed)
-		if m := reSENDZ.FindStringSubmatch(msg.Text); m != nil {
-			compressed, err := base85.Decode([]byte(m[1]))
-			if err != nil {
-				log.Printf("base85 decode error: %v", err)
-				return
-			}
-			raw, err := mux.Decompress(compressed)
-			if err != nil {
-				log.Printf("decompress error: %v", err)
-				return
-			}
-			writeToUpstream(raw)
-			return
-		}
-
-		// SEND text (uncompressed)
-		if m := reSEND.FindStringSubmatch(msg.Text); m != nil {
-			raw, err := base85.Decode([]byte(m[1]))
-			if err != nil {
-				log.Printf("base85 decode error: %v", err)
-				return
-			}
-			writeToUpstream(raw)
-			return
-		}
-
-		// CLOSE
-		if m := reCLOSE.FindStringSubmatch(msg.Text); m != nil {
-			streamID := m[1]
-			log.Printf("Closing stream %s", streamID)
-			connsMu.Lock()
-			conn, ok := conns[streamID]
-			if ok {
-				delete(conns, streamID)
-			}
-			connsMu.Unlock()
-			if ok {
-				conn.Close()
-				rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
-			}
-			return
-		}
+	// Check for HELLO handshake
+	if !*helloSent && msg.Text == "HELLO" {
+		chatID := fmt.Sprintf("%d", msg.Chat.ID)
+		*helloSent = true
+		helloCh <- chatID
+		return
 	}
 
-	// SEND.bin / SEND.z.bin file — use pollClient for downloads
-	if filesEnabled && msg.Document != nil {
-		fn := msg.Document.FileName
-		if fn == "SEND.bin" || fn == "SEND.z.bin" {
-			raw, err := pollClient.DownloadDocument(ctx, msg.Document.FileID)
-			if err != nil {
-				log.Printf("Download document error: %v", err)
-				return
-			}
-			if fn == "SEND.z.bin" {
-				raw, err = mux.Decompress(raw)
-				if err != nil {
-					log.Printf("decompress error: %v", err)
-					return
-				}
-			}
-			writeToUpstream(raw)
-			return
-		}
+	// Try to decode as KCP packet (server receives "C" prefix from client)
+	if data := serverDecoder.DecodeKCPPacket(ctx, msg, pollClient, filesEnabled); data != nil {
+		addr := &transport.TelegramAddr{ChatID: fmt.Sprintf("%d", msg.Chat.ID)}
+		tgConn.Feed(data, addr)
 	}
 }
 
-func writeToUpstream(raw []byte) {
-	for _, f := range mux.UnpackFrames(raw) {
-		connsMu.Lock()
-		conn, ok := conns[f.StreamID]
-		connsMu.Unlock()
-		if ok {
-			conn.Write(f.Data)
-		}
-	}
-}
-
-func newStreamID() string {
-	f, _ := os.Open("/dev/urandom")
-	b := make([]byte, 16)
-	f.Read(b)
-	f.Close()
-	return fmt.Sprintf("%x", b)
-}
-
-func runPolling(ctx context.Context, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func runPolling(ctx context.Context, pollClient *tg.Client, tgConn *transport.TelegramPacketConn, helloCh chan string, filesEnabled bool) {
 	var offset *int
+	helloSent := false
 	for {
 		updates, err := pollClient.GetUpdates(ctx, offset, 10)
 		if err != nil {
@@ -257,14 +178,19 @@ func runPolling(ctx context.Context, pollClient *tg.Client, clients []*tg.Client
 		for _, u := range updates {
 			newOff := u.UpdateID + 1
 			offset = &newOff
-			if u.ChannelPost != nil {
-				handleMessage(ctx, u.ChannelPost, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+			msg := u.ChannelPost
+			if msg == nil {
+				msg = u.Message
+			}
+			if msg != nil {
+				routeMessage(ctx, msg, pollClient, tgConn, helloCh, &helloSent, filesEnabled)
 			}
 		}
 	}
 }
 
-func runWebhook(ctx context.Context, pollClient *tg.Client, clients []*tg.Client, sq *mux.SendQueue, botToken, webhookURL, webhookPort, upstreamHost, upstreamPort string, filesEnabled bool, chunkSize int) {
+func runWebhook(ctx context.Context, pollClient *tg.Client, tgConn *transport.TelegramPacketConn, helloCh chan string, botToken, webhookURL, webhookPort string, filesEnabled bool) {
+	helloSent := false
 	httpMux := http.NewServeMux()
 	httpMux.HandleFunc("/"+botToken, func(w http.ResponseWriter, r *http.Request) {
 		var update tg.Update
@@ -272,8 +198,12 @@ func runWebhook(ctx context.Context, pollClient *tg.Client, clients []*tg.Client
 			http.Error(w, "bad request", 400)
 			return
 		}
-		if update.ChannelPost != nil {
-			handleMessage(ctx, update.ChannelPost, pollClient, clients, sq, upstreamHost, upstreamPort, filesEnabled, chunkSize)
+		msg := update.ChannelPost
+		if msg == nil {
+			msg = update.Message
+		}
+		if msg != nil {
+			routeMessage(ctx, msg, pollClient, tgConn, helloCh, &helloSent, filesEnabled)
 		}
 		w.Write([]byte("ok"))
 	})

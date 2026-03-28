@@ -109,6 +109,7 @@ func (c *Client) SendMessage(ctx context.Context, chatID string, text string) er
 
 type Update struct {
 	UpdateID    int      `json:"update_id"`
+	Message     *Message `json:"message"`
 	ChannelPost *Message `json:"channel_post"`
 }
 
