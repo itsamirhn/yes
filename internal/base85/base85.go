@@ -88,7 +88,10 @@ func Decode(src []byte) ([]byte, error) {
 		di += 4
 	}
 
-	if tail > 0 {
+	if tail == 1 {
+		return nil, errors.New("base85: invalid input length")
+	}
+	if tail > 1 {
 		// Pad with ~ (value 84)
 		var padded [5]byte
 		copy(padded[:], src[si:])

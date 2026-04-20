@@ -33,11 +33,13 @@ func (s *StreamBuffer) Read(size int) ([]byte, error) {
 	}
 
 	// Drain any additional available data
+	closed := false
 	for len(s.buf) < size {
 		select {
 		case data, ok := <-s.ch:
 			if !ok {
-				break
+				closed = true
+				goto done
 			}
 			s.buf = append(s.buf, data...)
 		default:
@@ -53,6 +55,11 @@ done:
 	result := make([]byte, n)
 	copy(result, s.buf[:n])
 	s.buf = s.buf[n:]
+
+	// Return EOF only after all buffered data has been consumed
+	if closed && len(s.buf) == 0 {
+		return result, io.EOF
+	}
 	return result, nil
 }
 

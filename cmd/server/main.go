@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"yes/internal/base85"
 	"yes/internal/mux"
 	"yes/internal/tg"
@@ -38,7 +39,7 @@ var (
 
 	// Track seen request IDs to avoid duplicate handling
 	seenMu sync.Mutex
-	seen   = map[string]bool{}
+	seen   = map[string]time.Time{}
 )
 
 func envOr(key, def string) string {
@@ -85,6 +86,21 @@ func main() {
 	log.Printf("File transfers: %v", filesEnabled)
 	log.Printf("Upstream: %s:%s", upstreamHost, upstreamPort)
 
+	// Periodic cleanup of seen map
+	go func() {
+		for {
+			time.Sleep(5 * time.Minute)
+			cutoff := time.Now().Add(-5 * time.Minute)
+			seenMu.Lock()
+			for id, t := range seen {
+				if t.Before(cutoff) {
+					delete(seen, id)
+				}
+			}
+			seenMu.Unlock()
+		}
+	}()
+
 	// Use first client for receiving
 	pollClient := clients[0]
 
@@ -110,11 +126,11 @@ func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, 
 			requestID := m[1]
 
 			seenMu.Lock()
-			if seen[requestID] {
+			if _, dup := seen[requestID]; dup {
 				seenMu.Unlock()
 				return
 			}
-			seen[requestID] = true
+			seen[requestID] = time.Now()
 			seenMu.Unlock()
 
 			log.Printf("New tunnel request %s, connecting to %s:%s", requestID, upstreamHost, upstreamPort)
@@ -123,6 +139,7 @@ func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, 
 			conn, err := net.Dial("tcp", upstreamHost+":"+upstreamPort)
 			if err != nil {
 				log.Printf("Failed to connect to upstream: %v", err)
+				rrClient(clients).SendMessage(ctx, chatID, "FAIL "+requestID)
 				return
 			}
 
@@ -148,9 +165,12 @@ func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, 
 						}
 						log.Printf("Upstream closed for stream %s", streamID)
 						connsMu.Lock()
+						_, stillTracked := conns[streamID]
 						delete(conns, streamID)
 						connsMu.Unlock()
-						rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
+						if stillTracked {
+							rrClient(clients).SendMessage(ctx, chatID, "CLOSED "+streamID)
+						}
 						return
 					}
 				}
@@ -233,7 +253,14 @@ func writeToUpstream(raw []byte) {
 		conn, ok := conns[f.StreamID]
 		connsMu.Unlock()
 		if ok {
-			conn.Write(f.Data)
+			_, err := conn.Write(f.Data)
+			if err != nil {
+				log.Printf("Upstream write error for %s: %v", f.StreamID, err)
+				connsMu.Lock()
+				delete(conns, f.StreamID)
+				connsMu.Unlock()
+				conn.Close()
+			}
 		}
 	}
 }

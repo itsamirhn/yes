@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"io"
+	"log"
 )
 
 type Frame struct {
@@ -55,6 +56,7 @@ func UnpackFrames(raw []byte) []Frame {
 		length := binary.BigEndian.Uint32(raw[offset+16 : offset+20])
 		offset += 20
 		if offset+int(length) > len(raw) {
+			log.Printf("UnpackFrames: truncated frame for stream %s (need %d bytes, have %d)", streamID, length, len(raw)-offset)
 			break
 		}
 		data := make([]byte, length)

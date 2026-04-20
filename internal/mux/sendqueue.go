@@ -5,6 +5,7 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 	"yes/internal/base85"
 	"yes/internal/tg"
 )
@@ -80,9 +81,10 @@ func (q *SendQueue) flushLoop(ctx context.Context) {
 
 func (q *SendQueue) sendBatch(ctx context.Context, frames []Frame) {
 	chatID := q.getChatID()
-	if chatID == "" {
-		log.Printf("SendQueue: no chat ID set, dropping %d frames", len(frames))
-		return
+	for chatID == "" {
+		log.Printf("SendQueue: waiting for chat ID (%d frames pending)", len(frames))
+		time.Sleep(500 * time.Millisecond)
+		chatID = q.getChatID()
 	}
 
 	raw := PackFrames(frames)

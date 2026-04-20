@@ -60,6 +60,7 @@ type apiResponse struct {
 }
 
 func (c *Client) doJSON(ctx context.Context, method string, body interface{}) (json.RawMessage, error) {
+	backoff := time.Second
 	for {
 		data, err := json.Marshal(body)
 		if err != nil {
@@ -76,10 +77,14 @@ func (c *Client) doJSON(ctx context.Context, method string, body interface{}) (j
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			log.Printf("HTTP error for %s: %v, retrying in 1s", method, err)
-			time.Sleep(time.Second)
+			log.Printf("HTTP error for %s: %v, retrying in %v", method, err, backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = time.Second
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
@@ -165,6 +170,7 @@ func (c *Client) SendDocument(ctx context.Context, chatID string, data []byte, f
 	part.Write(data)
 	w.Close()
 
+	backoff := time.Second
 	for {
 		req, err := http.NewRequestWithContext(ctx, "POST", c.apiURL("sendDocument"), bytes.NewReader(buf.Bytes()))
 		if err != nil {
@@ -177,10 +183,14 @@ func (c *Client) SendDocument(ctx context.Context, chatID string, data []byte, f
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			log.Printf("HTTP error for sendDocument: %v, retrying in 1s", err)
-			time.Sleep(time.Second)
+			log.Printf("HTTP error for sendDocument: %v, retrying in %v", err, backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
+		backoff = time.Second
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
@@ -218,6 +228,7 @@ func (c *Client) GetFile(ctx context.Context, fileID string) (string, error) {
 
 func (c *Client) DownloadFile(ctx context.Context, filePath string) ([]byte, error) {
 	url := c.fileBaseURL() + c.Token + "/" + filePath
+	backoff := time.Second
 	for {
 		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
@@ -228,15 +239,21 @@ func (c *Client) DownloadFile(ctx context.Context, filePath string) ([]byte, err
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
-			log.Printf("Download error: %v, retrying in 1s", err)
-			time.Sleep(time.Second)
+			log.Printf("Download error: %v, retrying in %v", err, backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
 		data, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
-			log.Printf("Download returned %d, retrying in 1s", resp.StatusCode)
-			time.Sleep(time.Second)
+			log.Printf("Download returned %d, retrying in %v", resp.StatusCode, backoff)
+			time.Sleep(backoff)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
 			continue
 		}
 		return data, nil

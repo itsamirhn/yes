@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"yes/internal/base85"
 	"yes/internal/mux"
 	"yes/internal/tg"
@@ -26,6 +27,7 @@ func rrClient(clients []*tg.Client) *tg.Client {
 
 var (
 	reOK     = regexp.MustCompile(`^OK (\S+) (\S+)$`)
+	reFAIL   = regexp.MustCompile(`^FAIL (\S+)$`)
 	reRECV   = regexp.MustCompile(`^RECV (\S+)$`)
 	reRECVZ  = regexp.MustCompile(`^RECV\.z (\S+)$`)
 	reCLOSED = regexp.MustCompile(`^CLOSED (\S+)$`)
@@ -193,12 +195,29 @@ func openConnection(ctx context.Context, clients []*tg.Client, chatID string) (*
 		return nil, "", err
 	}
 
-	result := <-ch
-	connectsMu.Lock()
-	delete(connects, requestID)
-	connectsMu.Unlock()
+	timer := time.NewTimer(30 * time.Second)
+	defer timer.Stop()
 
-	return result.buf, result.streamID, nil
+	select {
+	case result := <-ch:
+		connectsMu.Lock()
+		delete(connects, requestID)
+		connectsMu.Unlock()
+		if result.buf == nil {
+			return nil, "", fmt.Errorf("server rejected connection for request %s", requestID)
+		}
+		return result.buf, result.streamID, nil
+	case <-timer.C:
+		connectsMu.Lock()
+		delete(connects, requestID)
+		connectsMu.Unlock()
+		return nil, "", fmt.Errorf("timeout waiting for server response to request %s", requestID)
+	case <-ctx.Done():
+		connectsMu.Lock()
+		delete(connects, requestID)
+		connectsMu.Unlock()
+		return nil, "", ctx.Err()
+	}
 }
 
 func newRequestID() string {
@@ -228,6 +247,19 @@ func handleMessage(ctx context.Context, msg *tg.Message, pollClient *tg.Client, 
 				streams[streamID] = buf
 				streamsMu.Unlock()
 				ch <- connectResult{streamID: streamID, buf: buf}
+			}
+			return
+		}
+
+		// FAIL
+		if m := reFAIL.FindStringSubmatch(msg.Text); m != nil {
+			requestID := m[1]
+			log.Printf("FAIL for request %s", requestID)
+			connectsMu.Lock()
+			ch, ok := connects[requestID]
+			connectsMu.Unlock()
+			if ok {
+				ch <- connectResult{}
 			}
 			return
 		}
